@@ -1,0 +1,29 @@
+{
+  "pewpew": {
+    "repo": "noahbaxter/pewpew",
+    "branch": "main",
+    "target": "PewPew",
+    "productName": "PewPew",
+    "bundleId": "com.dichoticstudios.pewpew",
+    "r2Bucket": "vst-pewpew",
+    "windowsInstaller": "scripts/installer/windows/installer.iss",
+    "downloadBaseUrl": "https://dichoticstudios.com",
+    "manifestPath": "static/updates/pewpew.json",
+    "webBuild": {
+      "dir": "web",
+      "usesWebplugUi": true
+    }
+  },
+  "guillotine": {
+    "repo": "noahbaxter/guillotine",
+    "branch": "main",
+    "target": "Guillotine",
+    "productName": "Guillotine Clip",
+    "bundleId": "com.dichoticstudios.guillotine",
+    "r2Bucket": "vst-guillotine",
+    "windowsInstaller": "installer/windows/installer.iss",
+    "downloadBaseUrl": "https://dichoticstudios.com",
+    "manifestPath": "static/updates/guillotine.json",
+    "webBuild": null
+  }
+}

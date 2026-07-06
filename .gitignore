@@ -1,0 +1,5 @@
+# Real secrets file — never commit. Copy .secrets.env.example to make it.
+.secrets.env
+
+# macOS cruft
+.DS_Store
