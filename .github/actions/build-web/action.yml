@@ -1,0 +1,51 @@
+name: Build web UI
+description: >
+  Build a plugin's WebView UI with bun. If the plugin depends on the private
+  webplug-ui package, rewrite its git URL to authenticated HTTPS first (with a
+  fail-fast access probe) so `bun install` can clone it.
+
+inputs:
+  web-dir:
+    description: Path to the plugin's web/ directory
+    required: true
+  uses-webplug-ui:
+    description: "'true' if the plugin depends on the private webplug-ui package"
+    required: true
+    default: "false"
+  token:
+    description: PLUGINS_CI_TOKEN (needs webplug-ui in its Repository access)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Authenticate to private webplug-ui
+      if: inputs.uses-webplug-ui == 'true'
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        if [ -z "${TOKEN:-}" ]; then
+          echo "::error::PLUGINS_CI_TOKEN empty — cannot fetch private webplug-ui"
+          exit 1
+        fi
+        # webplug-ui is pinned as git+ssh; rewrite ssh/git@ forms to token HTTPS
+        # (ssh-agent is unreliable on Windows runners).
+        for prefix in "git+ssh://git@github.com/" "ssh://git@github.com/" "git@github.com:"; do
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "$prefix"
+        done
+        if ! git ls-remote "https://x-access-token:${TOKEN}@github.com/noahbaxter/webplug-ui.git" HEAD >/dev/null 2>err.txt; then
+          echo "::error::PLUGINS_CI_TOKEN cannot read noahbaxter/webplug-ui (add it to the token's Repository access + Contents: Read):"
+          sed 's/x-access-token:[^@]*@/x-access-token:***@/g' err.txt
+          exit 1
+        fi
+        echo "webplug-ui access OK"
+
+    - name: bun install + build
+      shell: bash
+      working-directory: ${{ inputs.web-dir }}
+      run: |
+        set -euo pipefail
+        bun install --frozen-lockfile
+        bun run build

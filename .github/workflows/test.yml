@@ -1,0 +1,39 @@
+name: Check hub
+
+# Cheap PR/push validation for the hub itself: the manifest is valid JSON with the
+# fields the pipeline reads, and the shell scripts pass shellcheck. No plugin builds.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: false }
+
+      - name: Validate plugins.json
+        run: |
+          set -euo pipefail
+          jq empty plugins.json
+          # Every entry needs the fields the pipeline reads.
+          for p in $(jq -r 'keys[]' plugins.json); do
+            for f in repo branch target productName bundleId r2Bucket windowsInstaller manifestPath; do
+              v=$(jq -r --arg p "$p" --arg f "$f" '.[$p][$f] // empty' plugins.json)
+              [ -n "$v" ] || { echo "::error::$p is missing '$f' in plugins.json"; exit 1; }
+            done
+            # webBuild must be null or an object with a dir.
+            jq -e --arg p "$p" '.[$p].webBuild == null or (.[$p].webBuild | type == "object" and has("dir"))' \
+              plugins.json >/dev/null || { echo "::error::$p has a malformed webBuild"; exit 1; }
+          done
+          echo "plugins.json OK"
+
+      - name: Shellcheck scripts
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          # SC1091: scripts source lib.sh via a runtime-computed path shellcheck can't follow.
+          shellcheck -e SC1091 scripts/*.sh

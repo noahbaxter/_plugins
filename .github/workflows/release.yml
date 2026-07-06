@@ -1,0 +1,471 @@
+name: Release plugin
+
+# One generic pipeline for every Dichotic Studios plugin. Driven by plugins.json.
+#
+# Trigger it two ways:
+#   - Actions UI / `make release PLUGIN=pewpew VERSION=0.2.0`  (workflow_dispatch)
+#   - push a tag like `pewpew-v0.2.0`                          (parsed into plugin + version)
+#
+# What it does for the selected plugin:
+#   checkout its latest branch -> build mac/win/linux -> sign+notarize macOS ->
+#   package (.pkg / Inno .exe / Linux .zip) -> upload to R2 -> draft GitHub release on
+#   THIS hub -> (optional) publish the update manifest to the dichoticstudios.com site.
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugin:
+        description: Plugin to release
+        required: true
+        type: choice
+        # Keep in sync with plugins.json (scripts/add-plugin.sh reminds you).
+        options:
+          - pewpew
+          - guillotine
+      version:
+        description: Version (blank = read the plugin's VERSION file)
+        required: false
+        type: string
+      publish_manifest:
+        description: Publish the update manifest to the site
+        required: false
+        type: boolean
+        default: true
+  push:
+    tags:
+      - '*-v*'
+
+permissions:
+  contents: write   # cut the draft release on this hub repo via the built-in GITHUB_TOKEN
+
+env:
+  R2_ENDPOINT: https://ee4f7641599153d817b6bddbea5483e7.r2.cloudflarestorage.com
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Resolve which plugin + version to build and load its config from plugins.json.
+  # Everything downstream reads these outputs; no plugin-specific logic elsewhere.
+  # --------------------------------------------------------------------------
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      plugin: ${{ steps.cfg.outputs.plugin }}
+      version: ${{ steps.cfg.outputs.version }}
+      repo: ${{ steps.cfg.outputs.repo }}
+      branch: ${{ steps.cfg.outputs.branch }}
+      target: ${{ steps.cfg.outputs.target }}
+      product: ${{ steps.cfg.outputs.product }}
+      bundleId: ${{ steps.cfg.outputs.bundleId }}
+      r2Bucket: ${{ steps.cfg.outputs.r2Bucket }}
+      winInstaller: ${{ steps.cfg.outputs.winInstaller }}
+      downloadBaseUrl: ${{ steps.cfg.outputs.downloadBaseUrl }}
+      manifestPath: ${{ steps.cfg.outputs.manifestPath }}
+      hasWeb: ${{ steps.cfg.outputs.hasWeb }}
+      webDir: ${{ steps.cfg.outputs.webDir }}
+      usesWebplugUi: ${{ steps.cfg.outputs.usesWebplugUi }}
+      publishManifest: ${{ steps.cfg.outputs.publishManifest }}
+    steps:
+      - name: Checkout hub
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Resolve plugin + version + config
+        id: cfg
+        env:
+          GH_TOKEN: ${{ secrets.PLUGINS_CI_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Determine plugin + version from the tag or the dispatch inputs.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"          # e.g. pewpew-v0.2.0
+            PLUGIN="${TAG%-v*}"                       # pewpew
+            VERSION="${TAG##*-v}"                     # 0.2.0
+            PUBLISH="true"
+          else
+            PLUGIN="${{ github.event.inputs.plugin }}"
+            VERSION="${{ github.event.inputs.version }}"
+            PUBLISH="${{ github.event.inputs.publish_manifest }}"
+          fi
+
+          jq -e --arg p "$PLUGIN" 'has($p)' plugins.json >/dev/null \
+            || { echo "::error::plugin '$PLUGIN' not found in plugins.json"; exit 1; }
+
+          get() { jq -r --arg p "$PLUGIN" ".[\$p]$1 // empty" plugins.json; }
+
+          REPO=$(get '.repo')
+          BRANCH=$(get '.branch')
+          [ -n "$BRANCH" ] || BRANCH=main
+
+          # Version fallback: read the plugin's VERSION file from its repo (no clone).
+          if [ -z "$VERSION" ]; then
+            VERSION=$(gh api "repos/$REPO/contents/VERSION?ref=$BRANCH" \
+              -H "Accept: application/vnd.github.raw" 2>/dev/null | tr -d '[:space:]' || true)
+            [ -n "$VERSION" ] \
+              || { echo "::error::no version given and $REPO has no readable VERSION file"; exit 1; }
+          fi
+
+          if jq -e --arg p "$PLUGIN" '.[$p].webBuild != null' plugins.json >/dev/null; then
+            HAS_WEB=true
+            WEB_DIR=$(get '.webBuild.dir'); [ -n "$WEB_DIR" ] || WEB_DIR=web
+            USES_WEBPLUG=$(get '.webBuild.usesWebplugUi'); [ -n "$USES_WEBPLUG" ] || USES_WEBPLUG=false
+          else
+            HAS_WEB=false; WEB_DIR=""; USES_WEBPLUG=false
+          fi
+
+          {
+            echo "plugin=$PLUGIN"
+            echo "version=$VERSION"
+            echo "repo=$REPO"
+            echo "branch=$BRANCH"
+            echo "target=$(get '.target')"
+            echo "product=$(get '.productName')"
+            echo "bundleId=$(get '.bundleId')"
+            echo "r2Bucket=$(get '.r2Bucket')"
+            echo "winInstaller=$(get '.windowsInstaller')"
+            echo "downloadBaseUrl=$(get '.downloadBaseUrl')"
+            echo "manifestPath=$(get '.manifestPath')"
+            echo "hasWeb=$HAS_WEB"
+            echo "webDir=$WEB_DIR"
+            echo "usesWebplugUi=$USES_WEBPLUG"
+            echo "publishManifest=$PUBLISH"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Releasing $PLUGIN v$VERSION from $REPO@$BRANCH"
+
+  # --------------------------------------------------------------------------
+  # macOS: build universal, sign, notarize, staple, build signed .pkg.
+  # --------------------------------------------------------------------------
+  build-macos:
+    needs: setup
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: false }
+      - uses: maxim-lobanov/setup-xcode@v1
+        with: { xcode-version: latest-stable }
+
+      - name: Check out plugin at latest branch
+        uses: ./.github/actions/checkout-plugin
+        with:
+          plugin: ${{ needs.setup.outputs.plugin }}
+          repo: ${{ needs.setup.outputs.repo }}
+          branch: ${{ needs.setup.outputs.branch }}
+          token: ${{ secrets.PLUGINS_CI_TOKEN }}
+
+      - name: Setup Bun
+        if: needs.setup.outputs.hasWeb == 'true'
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+
+      - name: Build web UI
+        if: needs.setup.outputs.hasWeb == 'true'
+        uses: ./.github/actions/build-web
+        with:
+          web-dir: plugins/${{ needs.setup.outputs.plugin }}/${{ needs.setup.outputs.webDir }}
+          uses-webplug-ui: ${{ needs.setup.outputs.usesWebplugUi }}
+          token: ${{ secrets.PLUGINS_CI_TOKEN }}
+
+      - name: Configure + build (universal)
+        env:
+          PDIR: plugins/${{ needs.setup.outputs.plugin }}
+        run: |
+          cmake -B "$PDIR/build" -S "$PDIR" -G Xcode \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+          cmake --build "$PDIR/build" --config Release --parallel
+
+      - name: Package signed .pkg
+        env:
+          PLUGIN: ${{ needs.setup.outputs.plugin }}
+          TARGET: ${{ needs.setup.outputs.target }}
+          PRODUCT: ${{ needs.setup.outputs.product }}
+          BUNDLE_ID: ${{ needs.setup.outputs.bundleId }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          APPLE_CERTIFICATE_APPLICATION: ${{ secrets.APPLE_CERTIFICATE_APPLICATION }}
+          APPLE_CERTIFICATE_INSTALLER: ${{ secrets.APPLE_CERTIFICATE_INSTALLER }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          # Signing identities are not secret (visible via `codesign -dv`); derived from team id.
+          APP_IDENTITY: "Developer ID Application: Noah Baxter (${{ secrets.APPLE_TEAM_ID }})"
+          PKG_IDENTITY: "Developer ID Installer: Noah Baxter (${{ secrets.APPLE_TEAM_ID }})"
+        run: |
+          set -euo pipefail
+          ART="plugins/$PLUGIN/build/${TARGET}_artefacts/Release"
+          VST3="$ART/VST3/${PRODUCT}.vst3"
+          AU="$ART/AU/${PRODUCT}.component"
+          [ -d "$VST3" ] || { echo "::error::VST3 not found at $VST3"; find "plugins/$PLUGIN/build" -name '*.vst3' -maxdepth 6; exit 1; }
+
+          PKG_ROOT="build/pkg-root"; PKG_OUT="build/installer"
+          mkdir -p "$PKG_ROOT/Library/Audio/Plug-Ins/VST3" \
+                   "$PKG_ROOT/Library/Audio/Plug-Ins/Components" "$PKG_OUT"
+          cp -R "$VST3" "$PKG_ROOT/Library/Audio/Plug-Ins/VST3/"
+          [ -d "$AU" ] && cp -R "$AU" "$PKG_ROOT/Library/Audio/Plug-Ins/Components/"
+
+          SIGNED=false
+          if [ -n "${APPLE_CERTIFICATE_APPLICATION:-}" ]; then
+            SIGNED=true
+            KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
+            KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+            security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+            echo "$APPLE_CERTIFICATE_APPLICATION" | base64 --decode > $RUNNER_TEMP/app.p12
+            echo "$APPLE_CERTIFICATE_INSTALLER"  | base64 --decode > $RUNNER_TEMP/installer.p12
+            security import $RUNNER_TEMP/app.p12       -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+            security import $RUNNER_TEMP/installer.p12  -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+            curl -sO https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+            security import DeveloperIDG2CA.cer -k "$KEYCHAIN_PATH"
+            security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+            codesign --force --deep --sign "$APP_IDENTITY" --options runtime --timestamp \
+              "$PKG_ROOT/Library/Audio/Plug-Ins/VST3/${PRODUCT}.vst3"
+            [ -d "$PKG_ROOT/Library/Audio/Plug-Ins/Components/${PRODUCT}.component" ] && \
+              codesign --force --deep --sign "$APP_IDENTITY" --options runtime --timestamp \
+                "$PKG_ROOT/Library/Audio/Plug-Ins/Components/${PRODUCT}.component"
+
+            xcrun notarytool store-credentials "notarytool-profile" \
+              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+          else
+            echo "::warning::No Apple signing secrets — building an UNSIGNED .pkg"
+          fi
+
+          OUT="$PKG_OUT/${TARGET}-${VERSION}-macOS.pkg"
+          if [ "$SIGNED" = true ]; then
+            pkgbuild --root "$PKG_ROOT" --identifier "${BUNDLE_ID}.pkg" --version "$VERSION" \
+              --install-location "/" "$PKG_OUT/unsigned.pkg"
+            productsign --sign "$PKG_IDENTITY" "$PKG_OUT/unsigned.pkg" "$OUT"
+            rm "$PKG_OUT/unsigned.pkg"
+            xcrun notarytool submit "$OUT" --keychain-profile "notarytool-profile" --wait
+            xcrun stapler staple "$OUT"
+          else
+            OUT="$PKG_OUT/${TARGET}-${VERSION}-macOS-UNSIGNED.pkg"
+            pkgbuild --root "$PKG_ROOT" --identifier "${BUNDLE_ID}.pkg" --version "$VERSION" \
+              --install-location "/" "$OUT"
+          fi
+          echo "built $OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-macos
+          path: build/installer/*.pkg
+          retention-days: 30
+
+  # --------------------------------------------------------------------------
+  # Windows: build x64, then Inno Setup installer. (Unsigned — see README TODO.)
+  # --------------------------------------------------------------------------
+  build-windows:
+    needs: setup
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: false }
+
+      - name: Check out plugin at latest branch
+        uses: ./.github/actions/checkout-plugin
+        with:
+          plugin: ${{ needs.setup.outputs.plugin }}
+          repo: ${{ needs.setup.outputs.repo }}
+          branch: ${{ needs.setup.outputs.branch }}
+          token: ${{ secrets.PLUGINS_CI_TOKEN }}
+
+      - name: Setup Bun
+        if: needs.setup.outputs.hasWeb == 'true'
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+
+      - name: Build web UI
+        if: needs.setup.outputs.hasWeb == 'true'
+        uses: ./.github/actions/build-web
+        with:
+          web-dir: plugins/${{ needs.setup.outputs.plugin }}/${{ needs.setup.outputs.webDir }}
+          uses-webplug-ui: ${{ needs.setup.outputs.usesWebplugUi }}
+          token: ${{ secrets.PLUGINS_CI_TOKEN }}
+
+      - name: Configure + build
+        shell: bash
+        env:
+          PDIR: plugins/${{ needs.setup.outputs.plugin }}
+        run: |
+          cmake -B "$PDIR/build" -S "$PDIR" -G "Visual Studio 17 2022" -A x64
+          cmake --build "$PDIR/build" --config Release --parallel
+
+      - name: TODO Authenticode sign the VST3 here (currently unsigned -> SmartScreen)
+        shell: bash
+        run: echo "::warning::Windows build is unsigned; add Authenticode signing before this step (see README)"
+
+      - name: Build Inno installer
+        shell: pwsh
+        env:
+          PLUGIN: ${{ needs.setup.outputs.plugin }}
+          ISS: ${{ needs.setup.outputs.winInstaller }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          choco install innosetup -y
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          $issPath = "plugins/$env:PLUGIN/$env:ISS"
+          if (-not (Test-Path $issPath)) { Write-Error "installer script not found: $issPath"; exit 1 }
+          $issDir = Split-Path $issPath
+          Push-Location $issDir
+          & $iscc /DVERSION=$env:VERSION (Split-Path $issPath -Leaf)
+          Pop-Location
+          New-Item -ItemType Directory -Force -Path installer-out | Out-Null
+          Get-ChildItem -Path $issDir -Filter *.exe | Copy-Item -Destination installer-out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-windows
+          path: installer-out/*.exe
+          retention-days: 30
+
+  # --------------------------------------------------------------------------
+  # Linux: build Release, zip the plugin bundles.
+  # --------------------------------------------------------------------------
+  build-linux:
+    needs: setup
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: false }
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build libasound2-dev \
+            libcurl4-openssl-dev libfreetype6-dev libgl1-mesa-dev libjack-jackd2-dev \
+            libwebkit2gtk-4.0-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev \
+            libxss-dev pkg-config
+
+      - name: Check out plugin at latest branch
+        uses: ./.github/actions/checkout-plugin
+        with:
+          plugin: ${{ needs.setup.outputs.plugin }}
+          repo: ${{ needs.setup.outputs.repo }}
+          branch: ${{ needs.setup.outputs.branch }}
+          token: ${{ secrets.PLUGINS_CI_TOKEN }}
+
+      - name: Setup Bun
+        if: needs.setup.outputs.hasWeb == 'true'
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+
+      - name: Build web UI
+        if: needs.setup.outputs.hasWeb == 'true'
+        uses: ./.github/actions/build-web
+        with:
+          web-dir: plugins/${{ needs.setup.outputs.plugin }}/${{ needs.setup.outputs.webDir }}
+          uses-webplug-ui: ${{ needs.setup.outputs.usesWebplugUi }}
+          token: ${{ secrets.PLUGINS_CI_TOKEN }}
+
+      - name: Configure + build
+        env:
+          PDIR: plugins/${{ needs.setup.outputs.plugin }}
+        run: |
+          cmake -B "$PDIR/build" -S "$PDIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$PDIR/build" --config Release --parallel
+
+      - name: Zip Linux bundles
+        env:
+          PLUGIN: ${{ needs.setup.outputs.plugin }}
+          TARGET: ${{ needs.setup.outputs.target }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          ART="plugins/$PLUGIN/build/${TARGET}_artefacts/Release"
+          [ -d "$ART" ] || { echo "::error::no artefacts at $ART"; exit 1; }
+          mkdir -p out staged
+          # Ship whatever formats the plugin produced (VST3/LV2/CLAP/Standalone).
+          for fmt in VST3 LV2 CLAP Standalone; do
+            [ -d "$ART/$fmt" ] && cp -R "$ART/$fmt" "staged/" || true
+          done
+          ( cd staged && zip -r "../out/${TARGET}-${VERSION}-Linux-x64.zip" . )
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-linux
+          path: out/*.zip
+          retention-days: 30
+
+  # --------------------------------------------------------------------------
+  # Release: draft GitHub release on the hub, upload to R2, publish the manifest.
+  # --------------------------------------------------------------------------
+  release:
+    needs: [setup, build-macos, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all installers
+        uses: actions/download-artifact@v4
+        with:
+          path: installers
+          merge-multiple: true
+
+      - name: List installers
+        run: ls -la installers
+
+      - name: Create draft release on the hub
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.setup.outputs.plugin }}-v${{ needs.setup.outputs.version }}
+          name: ${{ needs.setup.outputs.product }} v${{ needs.setup.outputs.version }}
+          draft: true
+          prerelease: true
+          files: installers/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload to R2 (stable + versioned names)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ env.R2_ENDPOINT }}
+          BUCKET: ${{ needs.setup.outputs.r2Bucket }}
+          TARGET: ${{ needs.setup.outputs.target }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "::warning::R2 secrets not set — skipping CDN upload"; exit 0
+          fi
+          cd installers
+          up() {  # up <localfile> <stable-name>
+            [ -f "$1" ] || { echo "::warning::missing $1 — skipping"; return 0; }
+            aws s3 cp "$1" "s3://$BUCKET/$1" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+            aws s3 cp "$1" "s3://$BUCKET/$2" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          }
+          up "${TARGET}-${VERSION}-macOS.pkg"      "${TARGET}-macOS.pkg"
+          up "${TARGET}-${VERSION}-macOS-UNSIGNED.pkg" "${TARGET}-macOS.pkg"
+          # Windows installer basename comes from the plugin's .iss OutputBaseFilename.
+          for f in *Windows*.exe; do [ -f "$f" ] && up "$f" "${TARGET}-Windows.exe"; done
+          up "${TARGET}-${VERSION}-Linux-x64.zip"  "${TARGET}-Linux-x64.zip"
+
+      - name: Publish update manifest to the site
+        if: needs.setup.outputs.publishManifest == 'true' && needs.setup.outputs.downloadBaseUrl != ''
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DEPLOY_TOKEN }}
+          MANIFEST_PATH: ${{ needs.setup.outputs.manifestPath }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          URL: ${{ needs.setup.outputs.downloadBaseUrl }}
+          PLUGIN: ${{ needs.setup.outputs.plugin }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::SITE_DEPLOY_TOKEN not set — skipping manifest publish"; exit 0
+          fi
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/noahbaxter/dichoticstudios.com.git" site
+          cd site
+          mkdir -p "$(dirname "$MANIFEST_PATH")"
+          printf '{\n  "version": "%s",\n  "url": "%s"\n}\n' "$VERSION" "$URL" > "$MANIFEST_PATH"
+          git config user.name "dichotic-plugins bot"
+          git config user.email "noahbaxt@gmail.com"
+          if git diff --quiet; then
+            echo "manifest already up to date"; exit 0
+          fi
+          git add "$MANIFEST_PATH"
+          git commit -m "Update $PLUGIN to v$VERSION"
+          git push
+          echo "published $MANIFEST_PATH -> version $VERSION"

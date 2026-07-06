@@ -1,0 +1,8 @@
+[submodule "plugins/pewpew"]
+	path = plugins/pewpew
+	url = https://github.com/noahbaxter/pewpew.git
+	branch = main
+[submodule "plugins/guillotine"]
+	path = plugins/guillotine
+	url = https://github.com/noahbaxter/guillotine.git
+	branch = main

@@ -1,0 +1,60 @@
+name: Check out plugin at latest branch
+description: >
+  Clone the selected plugin submodule at its latest branch tip (and its nested
+  submodules) using PLUGINS_CI_TOKEN for private-repo access. Pulls Git LFS too.
+
+inputs:
+  plugin:
+    description: Plugin name (submodule dir under plugins/)
+    required: true
+  repo:
+    description: owner/repo of the plugin (for error messages)
+    required: true
+  branch:
+    description: Branch to track
+    required: true
+    default: main
+  token:
+    description: PLUGINS_CI_TOKEN (Contents:Read on all plugin repos + webplug-ui)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Authenticate git for private clones
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        REPO: ${{ inputs.repo }}
+      run: |
+        set -euo pipefail
+        if [ -z "${TOKEN:-}" ]; then
+          echo "::error::PLUGINS_CI_TOKEN is empty — cannot check out ${REPO}"
+          exit 1
+        fi
+        # Rewrite github URLs to authenticated HTTPS so private submodules clone.
+        for prefix in "https://github.com/" "git@github.com:" \
+                      "git+ssh://git@github.com/" "ssh://git@github.com/"; do
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "$prefix"
+        done
+        # Fail fast with a masked, clear error if the token can't read the plugin repo.
+        # NOTE: a 404 "Repository not found" here means the token's Repository access
+        # does not include this repo — NOT an auth failure. See README troubleshooting.
+        if ! git ls-remote "https://x-access-token:${TOKEN}@github.com/${REPO}.git" HEAD >/dev/null 2>err.txt; then
+          echo "::error::PLUGINS_CI_TOKEN cannot read ${REPO} (check the token has this repo selected + Contents: Read):"
+          sed 's/x-access-token:[^@]*@/x-access-token:***@/g' err.txt
+          exit 1
+        fi
+        echo "plugin repo access OK"
+
+    - name: Update submodule to latest branch
+      shell: bash
+      env:
+        PLUGIN: ${{ inputs.plugin }}
+      run: |
+        set -euo pipefail
+        git submodule update --remote --init --recursive "plugins/$PLUGIN"
+        # Pull LFS content (e.g. baked sprite PNGs) inside the plugin checkout.
+        git -C "plugins/$PLUGIN" lfs install --local >/dev/null 2>&1 || true
+        git -C "plugins/$PLUGIN" lfs pull >/dev/null 2>&1 || true
+        echo "checked out plugins/$PLUGIN @ $(git -C "plugins/$PLUGIN" rev-parse --short HEAD)"
