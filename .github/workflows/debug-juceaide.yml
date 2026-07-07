@@ -1,0 +1,84 @@
+# TEMPORARY debug workflow: isolate the juceaide binarydata crash on Windows.
+# Mirrors build-windows up through cmake configure (which generates juceaide.exe
+# and the binarydata input_file_list), then runs juceaide binarydata MANUALLY:
+#   1. per-file  - each source alone, to find a per-file size threshold / culprit
+#   2. cumulative - growing batches, to find a total-size threshold
+# It never builds the full plugin, never signs, never uploads. Delete after use.
+name: debug-juceaide
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: false }
+
+      - name: Check out pewpew at latest branch
+        uses: ./.github/actions/checkout-plugin
+        with:
+          plugin: pewpew
+          repo: noahbaxter/pewpew
+          branch: main
+          token: ${{ secrets.PLUGINS_CI_TOKEN }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+
+      - name: Build web UI
+        uses: ./.github/actions/build-web
+        with:
+          web-dir: plugins/pewpew/web
+          uses-webplug-ui: 'true'
+          token: ${{ secrets.PLUGINS_CI_TOKEN }}
+
+      - name: Configure only (generates juceaide + input_file_list)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -B plugins/pewpew/build -S plugins/pewpew -G "Visual Studio 17 2022" -A x64
+
+      - name: Probe juceaide binarydata
+        shell: bash
+        run: |
+          set -uo pipefail
+          BUILD=plugins/pewpew/build
+          JA=$(find "$BUILD" -iname 'juceaide.exe' | head -1)
+          IFL=$(find "$BUILD" -ipath '*juce_binarydata_PewPewData*' -name 'input_file_list' | head -1)
+          echo "juceaide = $JA"
+          echo "list     = $IFL"
+          echo "=== input_file_list ==="
+          cat "$IFL"
+          echo "=== juceaide version ==="
+          "$JA" version || true
+
+          echo ""
+          echo "=== PER-FILE (each source alone) ==="
+          i=0
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            i=$((i+1))
+            printf '%s\n' "$f" > one.txt
+            rm -rf "out_$i"; mkdir -p "out_$i"
+            sz=$(stat -c%s "$f" 2>/dev/null || echo '?')
+            "$JA" binarydata BinaryData BinaryData.h "out_$i" one.txt > "log_$i.txt" 2>&1
+            rc=$?
+            echo "rc=$rc  size=$sz  $f  ::  $(tr '\n' ' ' < log_$i.txt)"
+          done < "$IFL"
+
+          echo ""
+          echo "=== CUMULATIVE (first k sources, growing) ==="
+          n=$(grep -c . "$IFL")
+          for k in $(seq 1 "$n"); do
+            head -n "$k" "$IFL" | grep . > batch.txt
+            rm -rf "bout_$k"; mkdir -p "bout_$k"
+            tot=$(while IFS= read -r f; do stat -c%s "$f" 2>/dev/null || echo 0; done < batch.txt | awk '{s+=$1} END{print s}')
+            "$JA" binarydata BinaryData BinaryData.h "bout_$k" batch.txt > "blog_$k.txt" 2>&1
+            rc=$?
+            last=$(tail -n1 batch.txt)
+            echo "k=$k  rc=$rc  cumbytes=$tot  (+$last)  ::  $(tr '\n' ' ' < blog_$k.txt)"
+          done
+          echo "=== done ==="
