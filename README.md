@@ -1,9 +1,15 @@
 # _plugins — Dichotic Studios release hub
 
-Private meta-repo that owns CI/CD for every Dichotic Studios audio plugin: build, sign,
-notarize, package, upload to R2, cut a GitHub release, and publish the in-app update
-manifest. Secrets and the pipeline live **once, here**. Each plugin is a git submodule and
-one entry in `plugins.json`. No GitHub org.
+Public meta-repo (public for free Actions runners) that owns CI/CD for every Dichotic
+Studios audio plugin: build, sign, notarize, package, and upload to R2, then publish the
+in-app update manifest. Secrets and the pipeline live **once, here**. Each plugin is a git
+submodule and one entry in `plugins.json`. No GitHub org.
+
+It is safe to be public: Actions secrets are never exposed by a public repo, and the pipeline
+**never produces a public build artifact** (no `upload-artifact`, no GitHub release on this
+hub) — every build goes **straight to R2**, served only through the gated CDN
+(`cdn.dichoticstudios.com`). The hub only **reads** the plugin repos (checkout + webplug-ui);
+it never writes to them. Any GitHub release/tag on a plugin is one you cut by hand.
 
 Adding a new plugin is: `make add-plugin`, fill a few `plugins.json` fields, done.
 
@@ -38,7 +44,8 @@ _plugins/
 | `target` | CMake target name — artefacts land in `build/<target>_artefacts/Release/` |
 | `productName` | bundle basename, may differ from target (e.g. `Guillotine Clip` vs target `Guillotine`) |
 | `bundleId` | `com.dichoticstudios.<x>`, used for the pkg identifier |
-| `r2Bucket` | Cloudflare R2 bucket for CDN uploads |
+| `r2Bucket` | shared Cloudflare R2 bucket (`dichotic-plugins`); builds upload under a `<plugin>/` key prefix |
+| `cdnBaseUrl` | public CDN base for this plugin's files, e.g. `https://cdn.dichoticstudios.com/pewpew` |
 | `windowsInstaller` | path to the Inno `.iss` inside the plugin (pewpew: `scripts/installer/windows/…`, guillotine: `installer/windows/…`) |
 | `downloadBaseUrl` | the `url` written into the update manifest (where users download) |
 | `manifestPath` | path in the site repo, e.g. `static/updates/pewpew.json` |
@@ -49,9 +56,9 @@ private `webplug-ui` package need the git URL rewrite before `bun install`.
 
 ## One-time setup
 
-1. **Create the repo** (already private):
+1. **Create the repo** (already done; public for free runners):
    ```bash
-   gh repo create noahbaxter/_plugins --private --source . --remote origin --push
+   gh repo create noahbaxter/_plugins --public --source . --remote origin --push
    ```
 
 2. **Add plugins** (already done for pewpew + guillotine):
@@ -115,11 +122,13 @@ What happens (per selected plugin):
 5. **Windows**: Inno Setup `.exe` from the plugin's `.iss`. **Unsigned** today (SmartScreen
    warning) — see TODO below.
 6. **Linux**: zips whatever formats built (VST3/LV2/CLAP/Standalone).
-7. **R2**: uploads stable names (`<Target>-macOS.pkg`, `<Target>-Windows.exe`,
-   `<Target>-Linux-x64.zip`) plus the versioned files. Skipped with a warning if R2 secrets
-   are unset.
-8. **GitHub release**: a **draft, prerelease** on THIS hub, tag `<plugin>-v<version>`, with
-   installers attached. (Uses the built-in `GITHUB_TOKEN`. R2 is the real download source.)
+7. **R2**: each build job uploads its installer **straight to R2** under `<plugin>/`, with
+   both a versioned key (`<Target>-<version>-macOS.pkg`) and a stable "latest" key
+   (`<Target>-macOS.pkg`). No `upload-artifact`, so nothing is ever publicly downloadable
+   from this hub — R2, served via the CDN, is the only store. The run fails if R2 secrets
+   are unset (a build with nowhere to go is a failed release).
+8. **finalize**: prints the R2/CDN keys and publishes the update manifest. It does **not**
+   create a GitHub release; if you want one as a changelog, cut it by hand on the plugin repo.
 9. **Update manifest** (if `publish_manifest` on and `downloadBaseUrl` set): commits
    `<manifestPath>` = `{ "version", "url" }` to `dichoticstudios.com`; Cloudflare Pages
    auto-deploys. This is what the in-app update notifier polls.
@@ -138,8 +147,10 @@ compiled URL.
 
 ## Manual ops / debugging
 
-- **Build without releasing**: there's no separate build-only trigger; dispatch a run and
-  just don't publish the draft (delete it after). Or run the plugin's own repo CI.
+- **Build without publishing**: a dispatch with `publish_manifest` off builds + uploads to
+  R2 without touching the site. To avoid overwriting the stable "latest" keys while testing,
+  bump `VERSION` to a throwaway (the versioned keys are separate). Or iterate one OS on the
+  plugin's own repo CI.
 - **Re-run a failed job**: Actions UI → the run → "Re-run failed jobs".
 - **One platform**: comment out the other `build-*` jobs' `needs` on `release`, or use the
   plugin's own repo CI to iterate a single OS.
@@ -169,11 +180,10 @@ compiled URL.
 
 | secret | used by |
 |--------|---------|
-| `PLUGINS_CI_TOKEN` | setup (version read), checkout-plugin (private submodule), build-web (webplug-ui) |
+| `PLUGINS_CI_TOKEN` | setup (version read), checkout-plugin (private submodule), build-web (webplug-ui). **Read-only.** |
 | `APPLE_CERTIFICATE_APPLICATION` / `_INSTALLER` / `_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | build-macos (sign + notarize) |
-| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | release (R2 upload) |
-| `SITE_DEPLOY_TOKEN` | release (manifest commit to the site repo) |
-| `GITHUB_TOKEN` (built-in) | release (draft release on this hub) |
+| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | build-macos / build-windows / build-linux (upload to R2), finalize (read back / summary) |
+| `SITE_DEPLOY_TOKEN` | finalize (manifest commit to the site repo) |
 
 ## Migrating a plugin repo off self-release
 

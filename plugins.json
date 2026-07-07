@@ -5,9 +5,10 @@
     "target": "PewPew",
     "productName": "PewPew",
     "bundleId": "com.dichoticstudios.pewpew",
-    "r2Bucket": "vst-pewpew",
+    "r2Bucket": "dichotic-plugins",
+    "cdnBaseUrl": "https://cdn.dichoticstudios.com/pewpew",
     "windowsInstaller": "scripts/installer/windows/installer.iss",
-    "downloadBaseUrl": "https://dichoticstudios.com",
+    "downloadBaseUrl": "https://dichoticstudios.com/download/pewpew",
     "manifestPath": "static/updates/pewpew.json",
     "webBuild": {
       "dir": "web",
@@ -20,9 +21,10 @@
     "target": "Guillotine",
     "productName": "Guillotine Clip",
     "bundleId": "com.dichoticstudios.guillotine",
-    "r2Bucket": "vst-guillotine",
+    "r2Bucket": "dichotic-plugins",
+    "cdnBaseUrl": "https://cdn.dichoticstudios.com/guillotine",
     "windowsInstaller": "installer/windows/installer.iss",
-    "downloadBaseUrl": "https://dichoticstudios.com",
+    "downloadBaseUrl": "https://dichoticstudios.com/download/guillotine",
     "manifestPath": "static/updates/guillotine.json",
     "webBuild": null
   }
