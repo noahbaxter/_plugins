@@ -21,38 +21,38 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Authenticate git for private clones
+    # One step so GH_TOKEN is in scope for both the access probe and every git
+    # call. We use `gh auth setup-git` (not a hand-built x-access-token URL): that
+    # form is for GitHub App tokens like the built-in GITHUB_TOKEN, and a
+    # fine-grained PAT rejects it with a misleading "Repository not found" even
+    # though the same token reads fine via the REST API. gh picks the right
+    # credential for whatever token type PLUGINS_CI_TOKEN is.
+    - name: Check out plugin at latest branch
       shell: bash
       env:
-        TOKEN: ${{ inputs.token }}
+        GH_TOKEN: ${{ inputs.token }}
+        PLUGIN: ${{ inputs.plugin }}
         REPO: ${{ inputs.repo }}
       run: |
         set -euo pipefail
-        if [ -z "${TOKEN:-}" ]; then
+        if [ -z "${GH_TOKEN:-}" ]; then
           echo "::error::PLUGINS_CI_TOKEN is empty — cannot check out ${REPO}"
           exit 1
         fi
-        # Rewrite github URLs to authenticated HTTPS so private submodules clone.
-        for prefix in "https://github.com/" "git@github.com:" \
-                      "git+ssh://git@github.com/" "ssh://git@github.com/"; do
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "$prefix"
-        done
-        # Fail fast with a masked, clear error if the token can't read the plugin repo.
-        # NOTE: a 404 "Repository not found" here means the token's Repository access
-        # does not include this repo — NOT an auth failure. See README troubleshooting.
-        if ! git ls-remote "https://x-access-token:${TOKEN}@github.com/${REPO}.git" HEAD >/dev/null 2>err.txt; then
-          echo "::error::PLUGINS_CI_TOKEN cannot read ${REPO} (check the token has this repo selected + Contents: Read):"
-          sed 's/x-access-token:[^@]*@/x-access-token:***@/g' err.txt
+        # Fail fast with a clear error if the token can't read the plugin repo.
+        # A 404 here means the token's Repository access does not include this repo
+        # (add it + Contents: Read) — see README troubleshooting.
+        if ! gh api "repos/${REPO}" --jq .full_name >/dev/null 2>err.txt; then
+          echo "::error::PLUGINS_CI_TOKEN cannot read ${REPO} (add this repo to the token's Repository access + Contents: Read):"
+          cat err.txt
           exit 1
         fi
-        echo "plugin repo access OK"
-
-    - name: Update submodule to latest branch
-      shell: bash
-      env:
-        PLUGIN: ${{ inputs.plugin }}
-      run: |
-        set -euo pipefail
+        # Make git use gh's credential for github.com, then also rewrite ssh forms
+        # to https so any ssh-pinned submodule URL clones over the authed https path.
+        gh auth setup-git
+        for prefix in "git@github.com:" "git+ssh://git@github.com/" "ssh://git@github.com/"; do
+          git config --global url."https://github.com/".insteadOf "$prefix"
+        done
         git submodule update --remote --init --recursive "plugins/$PLUGIN"
         # Pull LFS content (e.g. baked sprite PNGs) inside the plugin checkout.
         git -C "plugins/$PLUGIN" lfs install --local >/dev/null 2>&1 || true
