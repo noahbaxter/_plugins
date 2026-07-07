@@ -1,0 +1,41 @@
+# TEMPORARY: fast Windows-only compile/link check for pewpew's first-contact
+# Windows porting. Mirrors the release build-windows configure+build step but
+# skips signing, the installer, R2, and the mac/linux jobs - so each iteration
+# is ~5-8 min instead of a full release (which re-notarizes mac). Delete once
+# Windows builds clean and the real release is green.
+name: debug-winbuild
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: false }
+
+      - name: Check out pewpew at latest branch
+        uses: ./.github/actions/checkout-plugin
+        with:
+          plugin: pewpew
+          repo: noahbaxter/pewpew
+          branch: main
+          token: ${{ secrets.PLUGINS_CI_TOKEN }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+
+      - name: Build web UI
+        uses: ./.github/actions/build-web
+        with:
+          web-dir: plugins/pewpew/web
+          uses-webplug-ui: 'true'
+          token: ${{ secrets.PLUGINS_CI_TOKEN }}
+
+      - name: Configure + build (Release)
+        shell: bash
+        run: |
+          cmake -B plugins/pewpew/build -S plugins/pewpew -G "Visual Studio 17 2022" -A x64
+          cmake --build plugins/pewpew/build --config Release --parallel
