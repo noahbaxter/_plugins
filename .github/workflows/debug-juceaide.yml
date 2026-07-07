@@ -44,41 +44,46 @@ jobs:
       - name: Probe juceaide binarydata
         shell: bash
         run: |
-          set -uo pipefail
+          set +e
           BUILD=plugins/pewpew/build
           JA=$(find "$BUILD" -iname 'juceaide.exe' | head -1)
           IFL=$(find "$BUILD" -ipath '*juce_binarydata_PewPewData*' -name 'input_file_list' | head -1)
           echo "juceaide = $JA"
           echo "list     = $IFL"
-          echo "=== input_file_list ==="
-          cat "$IFL"
           echo "=== juceaide version ==="
-          "$JA" version || true
+          "$JA" version </dev/null
+
+          # Read the list into an array so the loop never shares stdin with juceaide.
+          mapfile -t FILES < <(grep . "$IFL")
+          echo "=== ${#FILES[@]} files ==="
+
+          run() { # run() <outdir> <listfile>  -> echoes rc, immune to crash/hang
+            timeout 180 "$JA" binarydata BinaryData BinaryData.h "$1" "$2" </dev/null >"$1.log" 2>&1
+            echo $?
+          }
 
           echo ""
           echo "=== PER-FILE (each source alone) ==="
           i=0
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
+          for f in "${FILES[@]}"; do
             i=$((i+1))
-            printf '%s\n' "$f" > one.txt
-            rm -rf "out_$i"; mkdir -p "out_$i"
-            sz=$(stat -c%s "$f" 2>/dev/null || echo '?')
-            "$JA" binarydata BinaryData BinaryData.h "out_$i" one.txt > "log_$i.txt" 2>&1
-            rc=$?
-            echo "rc=$rc  size=$sz  $f  ::  $(tr '\n' ' ' < log_$i.txt)"
-          done < "$IFL"
+            sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+            printf '%s\n' "$f" > "one_$i.txt"; rm -rf "out_$i"; mkdir -p "out_$i"
+            echo "-> [$i] START size=$sz $f"
+            rc=$(run "out_$i" "one_$i.txt")
+            echo "<- [$i] rc=$rc  :: $(tr '\n' ' ' < out_$i.log | head -c 300)"
+          done
 
           echo ""
           echo "=== CUMULATIVE (first k sources, growing) ==="
-          n=$(grep -c . "$IFL")
+          n=${#FILES[@]}
           for k in $(seq 1 "$n"); do
-            head -n "$k" "$IFL" | grep . > batch.txt
-            rm -rf "bout_$k"; mkdir -p "bout_$k"
-            tot=$(while IFS= read -r f; do stat -c%s "$f" 2>/dev/null || echo 0; done < batch.txt | awk '{s+=$1} END{print s}')
-            "$JA" binarydata BinaryData BinaryData.h "bout_$k" batch.txt > "blog_$k.txt" 2>&1
-            rc=$?
-            last=$(tail -n1 batch.txt)
-            echo "k=$k  rc=$rc  cumbytes=$tot  (+$last)  ::  $(tr '\n' ' ' < blog_$k.txt)"
+            printf '%s\n' "${FILES[@]:0:$k}" > "batch_$k.txt"; rm -rf "bout_$k"; mkdir -p "bout_$k"
+            tot=$(printf '%s\n' "${FILES[@]:0:$k}" | while IFS= read -r f; do wc -c < "$f"; done | awk '{s+=$1} END{print s}')
+            last="${FILES[$((k-1))]}"
+            echo "-> k=$k cumbytes=$tot (+$last)"
+            rc=$(run "bout_$k" "batch_$k.txt")
+            echo "<- k=$k rc=$rc :: $(tr '\n' ' ' < bout_$k.log | head -c 300)"
           done
           echo "=== done ==="
+          exit 0
