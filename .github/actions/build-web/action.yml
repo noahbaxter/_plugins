@@ -23,28 +23,34 @@ runs:
       if: inputs.uses-webplug-ui == 'true'
       shell: bash
       env:
-        TOKEN: ${{ inputs.token }}
+        GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
-        if [ -z "${TOKEN:-}" ]; then
+        if [ -z "${GH_TOKEN:-}" ]; then
           echo "::error::PLUGINS_CI_TOKEN empty — cannot fetch private webplug-ui"
           exit 1
         fi
-        # webplug-ui is pinned as git+ssh; rewrite ssh/git@ forms to token HTTPS
-        # (ssh-agent is unreliable on Windows runners).
-        for prefix in "git+ssh://git@github.com/" "ssh://git@github.com/" "git@github.com:"; do
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "$prefix"
-        done
-        if ! git ls-remote "https://x-access-token:${TOKEN}@github.com/noahbaxter/webplug-ui.git" HEAD >/dev/null 2>err.txt; then
+        if ! gh api "repos/noahbaxter/webplug-ui" --jq .full_name >/dev/null 2>err.txt; then
           echo "::error::PLUGINS_CI_TOKEN cannot read noahbaxter/webplug-ui (add it to the token's Repository access + Contents: Read):"
-          sed 's/x-access-token:[^@]*@/x-access-token:***@/g' err.txt
+          cat err.txt
           exit 1
         fi
+        # Make git use gh's credential for github.com (correct for a fine-grained
+        # PAT — the x-access-token URL form is app-token-only), and rewrite the
+        # git+ssh URL webplug-ui is pinned as to https so bun clones it over auth.
+        gh auth setup-git
+        for prefix in "git+ssh://git@github.com/" "ssh://git@github.com/" "git@github.com:"; do
+          git config --global url."https://github.com/".insteadOf "$prefix"
+        done
         echo "webplug-ui access OK"
 
     - name: bun install + build
       shell: bash
       working-directory: ${{ inputs.web-dir }}
+      env:
+        # gh's git credential helper reads GH_TOKEN at fetch time; bun shells out
+        # to git to clone webplug-ui, so the token must be present in this step too.
+        GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
         bun install --frozen-lockfile

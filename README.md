@@ -161,10 +161,14 @@ compiled URL.
 
 ## Troubleshooting
 
-- **bun can't fetch `webplug-ui` / 404 "Repository not found"**: the git `insteadOf` HTTPS
-  rewrite is the fix (handled in `actions/build-web`). A 404 means `PLUGINS_CI_TOKEN`'s
-  **Repository access does not include that repo** — it is a scope problem, not auth. Add
-  the repo (and `webplug-ui`) to the token and re-run.
+- **`git` says "Repository not found" but the token clearly works** (e.g. the API read of
+  `VERSION` succeeded): a fine-grained PAT **rejects the `https://x-access-token:<token>@`
+  git URL** — that form is only for GitHub App tokens like the built-in `GITHUB_TOKEN`. Both
+  composite actions now use `gh auth setup-git`, which picks the right credential. If you see
+  this, the token itself is fine; the auth *format* was wrong.
+- **404 "Repository not found" AND the API read also fails**: that one really is scope —
+  `PLUGINS_CI_TOKEN`'s **Repository access does not include that repo**. Add the repo (and
+  `webplug-ui`) under the token's Repository access + Contents: Read, and re-run.
 - **Windows installer unsigned → SmartScreen**: known gap. There's a clearly-marked TODO
   step in `release.yml` (`build-windows`) where Authenticode signing goes. To add it: get an
   EV/OV code-signing cert, store it as a secret, and `signtool sign /fd sha256 /tr <ts> …`
