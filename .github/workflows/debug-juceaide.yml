@@ -35,13 +35,34 @@ jobs:
           uses-webplug-ui: 'true'
           token: ${{ secrets.PLUGINS_CI_TOKEN }}
 
+      - name: Diagnose knob-art copy chain
+        shell: bash
+        run: |
+          set +e
+          W=plugins/pewpew/web
+          echo "=== is node_modules/webplug-ui a symlink or dir? ==="
+          ls -ld "$W/node_modules/webplug-ui"
+          echo "=== node_modules/webplug-ui/assets (does bun materialize assets?) ==="
+          ls -la "$W/node_modules/webplug-ui/assets" 2>&1 || echo "NO assets dir"
+          echo "=== node_modules/webplug-ui/assets/knob ==="
+          ls -la "$W/node_modules/webplug-ui/assets/knob" 2>&1 || echo "NO assets/knob dir"
+          echo "=== find any ba-*.png under node_modules/webplug-ui ==="
+          find "$W/node_modules/webplug-ui" -iname 'ba-*.png' 2>/dev/null || true
+          echo "=== web/assets/knob AFTER build (did the cp land them?) ==="
+          ls -la "$W/assets/knob" 2>&1 || echo "NO web/assets/knob dir"
+          echo "=== re-run the build:js copy verbosely (no 2>/dev/null) ==="
+          ( cd "$W" && mkdir -p assets/knob && cp -vf node_modules/webplug-ui/assets/knob/*.png assets/knob/ ) 2>&1 || echo "COPY FAILED rc=$?"
+          echo "=== done ==="
+
       - name: Configure only (generates juceaide + input_file_list)
+        if: false
         shell: bash
         run: |
           set -euo pipefail
           cmake -B plugins/pewpew/build -S plugins/pewpew -G "Visual Studio 17 2022" -A x64
 
       - name: Probe juceaide binarydata
+        if: false
         shell: bash
         run: |
           set +e
