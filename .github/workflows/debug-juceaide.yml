@@ -55,14 +55,12 @@ jobs:
           echo "=== done ==="
 
       - name: Configure only (generates juceaide + input_file_list)
-        if: false
         shell: bash
         run: |
           set -euo pipefail
           cmake -B plugins/pewpew/build -S plugins/pewpew -G "Visual Studio 17 2022" -A x64
 
       - name: Probe juceaide binarydata
-        if: false
         shell: bash
         run: |
           set +e
