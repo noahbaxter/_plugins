@@ -59,6 +59,7 @@ jobs:
       r2Bucket: ${{ steps.cfg.outputs.r2Bucket }}
       winInstaller: ${{ steps.cfg.outputs.winInstaller }}
       downloadBaseUrl: ${{ steps.cfg.outputs.downloadBaseUrl }}
+      cdnBaseUrl: ${{ steps.cfg.outputs.cdnBaseUrl }}
       manifestPath: ${{ steps.cfg.outputs.manifestPath }}
       hasWeb: ${{ steps.cfg.outputs.hasWeb }}
       webDir: ${{ steps.cfg.outputs.webDir }}
@@ -125,6 +126,7 @@ jobs:
             echo "r2Bucket=$(get '.r2Bucket')"
             echo "winInstaller=$(get '.windowsInstaller')"
             echo "downloadBaseUrl=$(get '.downloadBaseUrl')"
+            echo "cdnBaseUrl=$(get '.cdnBaseUrl')"
             echo "manifestPath=$(get '.manifestPath')"
             echo "hasWeb=$HAS_WEB"
             echo "webDir=$WEB_DIR"
@@ -249,11 +251,30 @@ jobs:
           fi
           echo "built $OUT"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: installer-macos
-          path: build/installer/*.pkg
-          retention-days: 30
+      # Publish straight to R2. We deliberately DO NOT use upload-artifact: on a
+      # public hub repo, run artifacts are publicly downloadable, and these are
+      # paid-plugin builds. R2 (private, served only via the gated CDN) is the one
+      # and only place a build is downloadable.
+      - name: Upload macOS build to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ env.R2_ENDPOINT }}
+          BUCKET: ${{ needs.setup.outputs.r2Bucket }}
+          PREFIX: ${{ needs.setup.outputs.plugin }}
+          TARGET: ${{ needs.setup.outputs.target }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "::error::R2 secrets not set — cannot publish the build"; exit 1
+          fi
+          PKG=$(ls build/installer/*.pkg)
+          VER="$PREFIX/${TARGET}-${VERSION}-macOS.pkg"   # explicit-version link
+          LATEST="$PREFIX/${TARGET}-macOS.pkg"            # stable "latest" link
+          aws s3 cp "$PKG" "s3://$BUCKET/$VER"    --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          aws s3 cp "$PKG" "s3://$BUCKET/$LATEST" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          echo "uploaded s3://$BUCKET/$VER (+ latest)"
 
   # --------------------------------------------------------------------------
   # Windows: build x64, then Inno Setup installer. (Unsigned — see README TODO.)
@@ -316,11 +337,27 @@ jobs:
           New-Item -ItemType Directory -Force -Path installer-out | Out-Null
           Get-ChildItem -Path $issDir -Filter *.exe | Copy-Item -Destination installer-out
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: installer-windows
-          path: installer-out/*.exe
-          retention-days: 30
+      - name: Upload Windows build to R2
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ env.R2_ENDPOINT }}
+          BUCKET: ${{ needs.setup.outputs.r2Bucket }}
+          PREFIX: ${{ needs.setup.outputs.plugin }}
+          TARGET: ${{ needs.setup.outputs.target }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "::error::R2 secrets not set — cannot publish the build"; exit 1
+          fi
+          EXE=$(ls installer-out/*.exe | head -1)
+          VER="$PREFIX/${TARGET}-${VERSION}-Windows.exe"
+          LATEST="$PREFIX/${TARGET}-Windows.exe"
+          aws s3 cp "$EXE" "s3://$BUCKET/$VER"    --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          aws s3 cp "$EXE" "s3://$BUCKET/$LATEST" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          echo "uploaded s3://$BUCKET/$VER (+ latest)"
 
   # --------------------------------------------------------------------------
   # Linux: build Release, zip the plugin bundles.
@@ -385,63 +422,50 @@ jobs:
           ( cd staged && zip -r "../out/${TARGET}-${VERSION}-Linux-x64.zip" . )
           ls -la out
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: installer-linux
-          path: out/*.zip
-          retention-days: 30
-
-  # --------------------------------------------------------------------------
-  # Release: draft GitHub release on the hub, upload to R2, publish the manifest.
-  # --------------------------------------------------------------------------
-  release:
-    needs: [setup, build-macos, build-windows, build-linux]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all installers
-        uses: actions/download-artifact@v4
-        with:
-          path: installers
-          merge-multiple: true
-
-      - name: List installers
-        run: ls -la installers
-
-      - name: Create draft release on the hub
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ needs.setup.outputs.plugin }}-v${{ needs.setup.outputs.version }}
-          name: ${{ needs.setup.outputs.product }} v${{ needs.setup.outputs.version }}
-          draft: true
-          prerelease: true
-          files: installers/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload to R2 (stable + versioned names)
+      - name: Upload Linux build to R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ env.R2_ENDPOINT }}
           BUCKET: ${{ needs.setup.outputs.r2Bucket }}
+          PREFIX: ${{ needs.setup.outputs.plugin }}
           TARGET: ${{ needs.setup.outputs.target }}
           VERSION: ${{ needs.setup.outputs.version }}
         run: |
           set -euo pipefail
           if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
-            echo "::warning::R2 secrets not set — skipping CDN upload"; exit 0
+            echo "::error::R2 secrets not set — cannot publish the build"; exit 1
           fi
-          cd installers
-          up() {  # up <localfile> <stable-name>
-            [ -f "$1" ] || { echo "::warning::missing $1 — skipping"; return 0; }
-            aws s3 cp "$1" "s3://$BUCKET/$1" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-            aws s3 cp "$1" "s3://$BUCKET/$2" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          }
-          up "${TARGET}-${VERSION}-macOS.pkg"      "${TARGET}-macOS.pkg"
-          up "${TARGET}-${VERSION}-macOS-UNSIGNED.pkg" "${TARGET}-macOS.pkg"
-          # Windows installer basename comes from the plugin's .iss OutputBaseFilename.
-          for f in *Windows*.exe; do [ -f "$f" ] && up "$f" "${TARGET}-Windows.exe"; done
-          up "${TARGET}-${VERSION}-Linux-x64.zip"  "${TARGET}-Linux-x64.zip"
+          ZIP=$(ls out/*.zip)
+          VER="$PREFIX/${TARGET}-${VERSION}-Linux-x64.zip"
+          LATEST="$PREFIX/${TARGET}-Linux-x64.zip"
+          aws s3 cp "$ZIP" "s3://$BUCKET/$VER"    --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          aws s3 cp "$ZIP" "s3://$BUCKET/$LATEST" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          echo "uploaded s3://$BUCKET/$VER (+ latest)"
+
+  # --------------------------------------------------------------------------
+  # Finalize: the builds are already in R2 (uploaded by each platform job).
+  # This job just publishes the update manifest to the site and prints the
+  # CDN URLs. The hub NEVER writes to the plugin repos (Read-only token) and
+  # NEVER produces a public artifact — R2, served via the gated CDN, is the
+  # one and only download source.
+  # --------------------------------------------------------------------------
+  finalize:
+    needs: [setup, build-macos, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize what landed in R2
+        env:
+          PLUGIN: ${{ needs.setup.outputs.plugin }}
+          TARGET: ${{ needs.setup.outputs.target }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          CDN: ${{ needs.setup.outputs.cdnBaseUrl }}
+        run: |
+          echo "Builds published to R2 under $PLUGIN/:"
+          echo "  $TARGET-$VERSION-macOS.pkg (+ $TARGET-macOS.pkg)"
+          echo "  $TARGET-$VERSION-Windows.exe (+ $TARGET-Windows.exe)"
+          echo "  $TARGET-$VERSION-Linux-x64.zip (+ $TARGET-Linux-x64.zip)"
+          [ -n "${CDN:-}" ] && echo "CDN latest: $CDN/$TARGET-macOS.pkg etc."
 
       - name: Publish update manifest to the site
         if: needs.setup.outputs.publishManifest == 'true' && needs.setup.outputs.downloadBaseUrl != ''
