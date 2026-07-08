@@ -53,7 +53,12 @@ runs:
         for prefix in "git@github.com:" "git+ssh://git@github.com/" "ssh://git@github.com/"; do
           git config --global url."https://github.com/".insteadOf "$prefix"
         done
-        git submodule update --remote --init --recursive "plugins/$PLUGIN"
+        # --remote (no --recursive) moves ONLY the plugin submodule to its branch
+        # tip; then a plain recursive update checks out the plugin's OWN pinned
+        # nested submodules (e.g. JUCE at the commit the plugin records, not
+        # JUCE's branch tip). --remote --recursive would wrongly bump those pins.
+        git submodule update --remote --init "plugins/$PLUGIN"
+        git -C "plugins/$PLUGIN" submodule update --init --recursive
         # Pull LFS content (e.g. baked sprite PNGs) inside the plugin checkout.
         git -C "plugins/$PLUGIN" lfs install --local >/dev/null 2>&1 || true
         git -C "plugins/$PLUGIN" lfs pull >/dev/null 2>&1 || true
