@@ -270,11 +270,12 @@ jobs:
             echo "::error::R2 secrets not set — cannot publish the build"; exit 1
           fi
           PKG=$(ls build/installer/*.pkg)
-          VER="$PREFIX/${TARGET}-${VERSION}-macOS.pkg"   # explicit-version link
-          LATEST="$PREFIX/${TARGET}-macOS.pkg"            # stable "latest" link
+          VNAME="${TARGET}-macOS-${VERSION}.pkg"          # versioned filename
+          VER="$PREFIX/$VNAME"                             # explicit-version link
+          LATEST="$PREFIX/${TARGET}-macOS.pkg"             # stable "latest" link (downloads as $VNAME)
           aws s3 cp "$PKG" "s3://$BUCKET/$VER"    --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          aws s3 cp "$PKG" "s3://$BUCKET/$LATEST" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          echo "uploaded s3://$BUCKET/$VER (+ latest)"
+          aws s3 cp "$PKG" "s3://$BUCKET/$LATEST" --content-disposition "attachment; filename=$VNAME" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          echo "uploaded s3://$BUCKET/$VER (+ latest as $VNAME)"
 
   # --------------------------------------------------------------------------
   # Windows: build x64, then Inno Setup installer. (Unsigned — see README TODO.)
@@ -355,11 +356,12 @@ jobs:
             echo "::error::R2 secrets not set — cannot publish the build"; exit 1
           fi
           EXE=$(ls installer-out/*.exe | head -1)
-          VER="$PREFIX/${TARGET}-${VERSION}-Windows.exe"
-          LATEST="$PREFIX/${TARGET}-Windows.exe"
+          VNAME="${TARGET}-Windows-${VERSION}.exe"
+          VER="$PREFIX/$VNAME"
+          LATEST="$PREFIX/${TARGET}-Windows.exe"           # stable "latest" link (downloads as $VNAME)
           aws s3 cp "$EXE" "s3://$BUCKET/$VER"    --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          aws s3 cp "$EXE" "s3://$BUCKET/$LATEST" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          echo "uploaded s3://$BUCKET/$VER (+ latest)"
+          aws s3 cp "$EXE" "s3://$BUCKET/$LATEST" --content-disposition "attachment; filename=$VNAME" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          echo "uploaded s3://$BUCKET/$VER (+ latest as $VNAME)"
 
   # --------------------------------------------------------------------------
   # Linux: build Release, zip the plugin bundles.
@@ -439,11 +441,12 @@ jobs:
             echo "::error::R2 secrets not set — cannot publish the build"; exit 1
           fi
           ZIP=$(ls out/*.zip)
-          VER="$PREFIX/${TARGET}-${VERSION}-Linux-x64.zip"
-          LATEST="$PREFIX/${TARGET}-Linux-x64.zip"
+          VNAME="${TARGET}-Linux-x64-${VERSION}.zip"
+          VER="$PREFIX/$VNAME"
+          LATEST="$PREFIX/${TARGET}-Linux-x64.zip"         # stable "latest" link (downloads as $VNAME)
           aws s3 cp "$ZIP" "s3://$BUCKET/$VER"    --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          aws s3 cp "$ZIP" "s3://$BUCKET/$LATEST" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          echo "uploaded s3://$BUCKET/$VER (+ latest)"
+          aws s3 cp "$ZIP" "s3://$BUCKET/$LATEST" --content-disposition "attachment; filename=$VNAME" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          echo "uploaded s3://$BUCKET/$VER (+ latest as $VNAME)"
 
   # --------------------------------------------------------------------------
   # Finalize: the builds are already in R2 (uploaded by each platform job).
@@ -464,9 +467,9 @@ jobs:
           CDN: ${{ needs.setup.outputs.cdnBaseUrl }}
         run: |
           echo "Builds published to R2 under $PLUGIN/:"
-          echo "  $TARGET-$VERSION-macOS.pkg (+ $TARGET-macOS.pkg)"
-          echo "  $TARGET-$VERSION-Windows.exe (+ $TARGET-Windows.exe)"
-          echo "  $TARGET-$VERSION-Linux-x64.zip (+ $TARGET-Linux-x64.zip)"
+          echo "  $TARGET-macOS-$VERSION.pkg (+ $TARGET-macOS.pkg, downloads versioned)"
+          echo "  $TARGET-Windows-$VERSION.exe (+ $TARGET-Windows.exe, downloads versioned)"
+          echo "  $TARGET-Linux-x64-$VERSION.zip (+ $TARGET-Linux-x64.zip, downloads versioned)"
           [ -n "${CDN:-}" ] && echo "CDN latest: $CDN/$TARGET-macOS.pkg etc."
 
       - name: Publish update manifest to the site
