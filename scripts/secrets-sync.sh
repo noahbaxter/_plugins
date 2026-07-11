@@ -29,7 +29,7 @@ KNOWN=(
   APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD
   R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY
   PLUGINS_CI_TOKEN
-  SITE_DEPLOY_TOKEN
+  SITE_DEPLOY_SSH_KEY
 )
 
 # Load the env file without leaking values into the shell's argv.
