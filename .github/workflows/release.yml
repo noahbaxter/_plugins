@@ -475,17 +475,24 @@ jobs:
       - name: Publish update manifest to the site
         if: needs.setup.outputs.publishManifest == 'true' && needs.setup.outputs.downloadBaseUrl != ''
         env:
-          GH_TOKEN: ${{ secrets.SITE_DEPLOY_TOKEN }}
+          SSH_KEY: ${{ secrets.SITE_DEPLOY_SSH_KEY }}
           MANIFEST_PATH: ${{ needs.setup.outputs.manifestPath }}
           VERSION: ${{ needs.setup.outputs.version }}
           URL: ${{ needs.setup.outputs.downloadBaseUrl }}
           PLUGIN: ${{ needs.setup.outputs.plugin }}
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::warning::SITE_DEPLOY_TOKEN not set — skipping manifest publish"; exit 0
+          if [ -z "${SSH_KEY:-}" ]; then
+            echo "::warning::SITE_DEPLOY_SSH_KEY not set, skipping manifest publish"; exit 0
           fi
-          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/noahbaxter/dichoticstudios.com.git" site
+          # Auth to the site repo with a write-scoped SSH deploy key (not a PAT). The site is a
+          # Git-connected Cloudflare Pages project, so this push auto-deploys to dichoticstudios.com.
+          mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/site_deploy"
+          chmod 600 "$HOME/.ssh/site_deploy"
+          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/site_deploy -o IdentitiesOnly=yes"
+          git clone --depth 1 git@github.com:noahbaxter/dichoticstudios.com.git site
           cd site
           mkdir -p "$(dirname "$MANIFEST_PATH")"
           printf '{\n  "version": "%s",\n  "url": "%s"\n}\n' "$VERSION" "$URL" > "$MANIFEST_PATH"

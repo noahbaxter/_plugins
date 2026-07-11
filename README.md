@@ -85,8 +85,10 @@ private `webplug-ui` package need the git URL rewrite before `bun install`.
      **Repository access you MUST explicitly select every plugin repo AND `webplug-ui`.**
      Fine-grained tokens default to public repos only; a missing repo shows up as a 404
      "Repository not found", which reads like an auth error but is a scope error.
-   - **`SITE_DEPLOY_TOKEN` (1, optional)** — fine-grained PAT, Contents: Read **and Write**
-     on `noahbaxter/dichoticstudios.com`. Only needed to publish the update manifest.
+   - **`SITE_DEPLOY_SSH_KEY` (1, optional)** — private half of a **write** SSH deploy key on
+     `noahbaxter/dichoticstudios.com`. Only needed to publish the update manifest. Generate with
+     `ssh-keygen -t ed25519`, add the public key as a write deploy key on that repo, store the
+     private key here.
 
 ## Adding a new plugin
 
@@ -187,7 +189,7 @@ compiled URL.
 | `PLUGINS_CI_TOKEN` | setup (version read), checkout-plugin (private submodule), build-web (webplug-ui). **Read-only.** |
 | `APPLE_CERTIFICATE_APPLICATION` / `_INSTALLER` / `_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | build-macos (sign + notarize) |
 | `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | build-macos / build-windows / build-linux (upload to R2), finalize (read back / summary) |
-| `SITE_DEPLOY_TOKEN` | finalize (manifest commit to the site repo) |
+| `SITE_DEPLOY_SSH_KEY` | finalize (manifest commit to the site repo, via write SSH deploy key) |
 
 ## Migrating a plugin repo off self-release
 
