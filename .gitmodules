@@ -6,3 +6,7 @@
 	path = plugins/guillotine
 	url = https://github.com/noahbaxter/guillotine.git
 	branch = main
+[submodule "plugins/chartchotic"]
+	path = plugins/chartchotic
+	url = https://github.com/noahbaxter/chartchotic.git
+	branch = main

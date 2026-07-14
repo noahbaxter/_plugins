@@ -27,5 +27,18 @@
     "downloadBaseUrl": "https://dichoticstudios.com/download/guillotine",
     "manifestPath": "static/updates/guillotine.json",
     "webBuild": null
+  },
+  "chartchotic": {
+    "repo": "noahbaxter/chartchotic",
+    "branch": "main",
+    "target": "Chartchotic",
+    "productName": "Chartchotic",
+    "bundleId": "com.dichoticstudios.chartchotic",
+    "r2Bucket": "dichotic-plugins",
+    "cdnBaseUrl": "https://cdn.dichoticstudios.com/chartchotic",
+    "windowsInstaller": ".ci/windows-installer.iss",
+    "downloadBaseUrl": "https://dichoticstudios.com/download/chartchotic",
+    "manifestPath": "static/updates/chartchotic.json",
+    "webBuild": null
   }
 }

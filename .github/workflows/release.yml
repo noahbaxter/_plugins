@@ -22,6 +22,7 @@ on:
         options:
           - pewpew
           - guillotine
+          - chartchotic
       version:
         description: Version (blank = read the plugin's VERSION file)
         required: false
