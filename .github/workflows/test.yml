@@ -22,13 +22,17 @@ jobs:
           jq empty plugins.json
           # Every entry needs the fields the pipeline reads.
           for p in $(jq -r 'keys[]' plugins.json); do
-            for f in repo branch target productName bundleId r2Bucket windowsInstaller manifestPath; do
+            for f in repo branch target productName bundleId r2Bucket cdnBaseUrl \
+                     windowsInstaller downloadBaseUrl manifestPath; do
               v=$(jq -r --arg p "$p" --arg f "$f" '.[$p][$f] // empty' plugins.json)
               [ -n "$v" ] || { echo "::error::$p is missing '$f' in plugins.json"; exit 1; }
             done
             # webBuild must be null or an object with a dir.
             jq -e --arg p "$p" '.[$p].webBuild == null or (.[$p].webBuild | type == "object" and has("dir"))' \
               plugins.json >/dev/null || { echo "::error::$p has a malformed webBuild"; exit 1; }
+            # gated is optional but must be a boolean when present.
+            jq -e --arg p "$p" '.[$p] | (has("gated") | not) or (.gated | type == "boolean")' \
+              plugins.json >/dev/null || { echo "::error::$p has a non-boolean gated"; exit 1; }
           done
           echo "plugins.json OK"
 
@@ -37,3 +41,9 @@ jobs:
           sudo apt-get update && sudo apt-get install -y shellcheck
           # SC1091: scripts source lib.sh via a runtime-computed path shellcheck can't follow.
           shellcheck -e SC1091 scripts/*.sh
+
+      - name: Lint changelog generator
+        run: |
+          sudo apt-get install -y python3
+          python3 -m py_compile scripts/changelog-entry.py
+          echo "changelog-entry.py OK"

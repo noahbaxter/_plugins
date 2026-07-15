@@ -2,20 +2,24 @@ name: Release plugin
 
 # One generic pipeline for every Dichotic Studios plugin. Driven by plugins.json.
 #
-# Trigger it two ways:
-#   - Actions UI / `make release PLUGIN=pewpew VERSION=0.2.0`  (workflow_dispatch)
-#   - push a tag like `pewpew-v0.2.0`                          (parsed into plugin + version)
+# Two modes, one workflow:
+#   - dry_run  : build + package on mac/win/linux, publish NOTHING. This is the
+#                continuous "does it still build everywhere" signal. Fired by a push
+#                to a plugin repo's main (see each repo's release-dispatch.yml).
+#   - publish  : build (signed + notarized on mac) -> stage to R2 -> and ONLY if all
+#                three platforms pass: promote to the live CDN keys, cut the GitHub
+#                release on the PLUGIN repo, and publish the plugin's changelog +
+#                update manifest to the dichoticstudios.com site. Fired by tagging
+#                the plugin repo (git tag vX.Y.Z && git push).
 #
-# What it does for the selected plugin:
-#   checkout its latest branch -> build mac/win/linux -> sign+notarize macOS ->
-#   package (.pkg / Inno .exe / Linux .zip) -> upload to R2 -> draft GitHub release on
-#   THIS hub -> (optional) publish the update manifest to the dichoticstudios.com site.
+# Atomic by construction: the publish job needs all three build jobs, so a single
+# platform failure means nothing is promoted, released, or published.
 
 on:
   workflow_dispatch:
     inputs:
       plugin:
-        description: Plugin to release
+        description: Plugin to build
         required: true
         type: choice
         # Keep in sync with plugins.json (scripts/add-plugin.sh reminds you).
@@ -27,17 +31,25 @@ on:
         description: Version (blank = read the plugin's VERSION file)
         required: false
         type: string
-      publish_manifest:
-        description: Publish the update manifest to the site
+      ref:
+        description: Exact plugin commit SHA to build (blank = branch tip)
+        required: false
+        type: string
+      dry_run:
+        description: Build only — publish nothing (no CDN, no release, no site)
         required: false
         type: boolean
-        default: true
+        default: false
   push:
+    # Hub-side manual fallback: `<plugin>-vX.Y.Z` on THIS repo always publishes.
     tags:
       - '*-v*'
 
-permissions:
-  contents: write   # cut the draft release on this hub repo via the built-in GITHUB_TOKEN
+# Cancel a superseded dry-run for the same plugin; never cancel a real publish
+# (publish runs land in a distinct group with cancel-in-progress = false).
+concurrency:
+  group: release-${{ github.event.inputs.plugin || github.ref_name }}-${{ github.event.inputs.dry_run || 'publish' }}
+  cancel-in-progress: ${{ github.event.inputs.dry_run == 'true' }}
 
 env:
   R2_ENDPOINT: https://ee4f7641599153d817b6bddbea5483e7.r2.cloudflarestorage.com
@@ -52,6 +64,7 @@ jobs:
     outputs:
       plugin: ${{ steps.cfg.outputs.plugin }}
       version: ${{ steps.cfg.outputs.version }}
+      ref: ${{ steps.cfg.outputs.ref }}
       repo: ${{ steps.cfg.outputs.repo }}
       branch: ${{ steps.cfg.outputs.branch }}
       target: ${{ steps.cfg.outputs.target }}
@@ -62,10 +75,11 @@ jobs:
       downloadBaseUrl: ${{ steps.cfg.outputs.downloadBaseUrl }}
       cdnBaseUrl: ${{ steps.cfg.outputs.cdnBaseUrl }}
       manifestPath: ${{ steps.cfg.outputs.manifestPath }}
+      gated: ${{ steps.cfg.outputs.gated }}
       hasWeb: ${{ steps.cfg.outputs.hasWeb }}
       webDir: ${{ steps.cfg.outputs.webDir }}
       usesWebplugUi: ${{ steps.cfg.outputs.usesWebplugUi }}
-      publishManifest: ${{ steps.cfg.outputs.publishManifest }}
+      dryRun: ${{ steps.cfg.outputs.dryRun }}
     steps:
       - name: Checkout hub
         uses: actions/checkout@v4
@@ -79,16 +93,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Determine plugin + version from the tag or the dispatch inputs.
+          # Determine plugin + version + ref + mode from the tag or the dispatch inputs.
           if [ "${{ github.event_name }}" = "push" ]; then
             TAG="${GITHUB_REF#refs/tags/}"          # e.g. pewpew-v0.2.0
             PLUGIN="${TAG%-v*}"                       # pewpew
             VERSION="${TAG##*-v}"                     # 0.2.0
-            PUBLISH="true"
+            REF=""                                    # hub-tag fallback: resolve branch tip below
+            DRY_RUN="false"
           else
             PLUGIN="${{ github.event.inputs.plugin }}"
             VERSION="${{ github.event.inputs.version }}"
-            PUBLISH="${{ github.event.inputs.publish_manifest }}"
+            REF="${{ github.event.inputs.ref }}"      # exact plugin commit from release-dispatch
+            DRY_RUN="${{ github.event.inputs.dry_run }}"
           fi
 
           jq -e --arg p "$PLUGIN" 'has($p)' plugins.json >/dev/null \
@@ -100,13 +116,33 @@ jobs:
           BRANCH=$(get '.branch')
           [ -n "$BRANCH" ] || BRANCH=main
 
-          # Version fallback: read the plugin's VERSION file from its repo (no clone).
-          if [ -z "$VERSION" ]; then
-            VERSION=$(gh api "repos/$REPO/contents/VERSION?ref=$BRANCH" \
-              -H "Accept: application/vnd.github.raw" 2>/dev/null | tr -d '[:space:]' || true)
-            [ -n "$VERSION" ] \
-              || { echo "::error::no version given and $REPO has no readable VERSION file"; exit 1; }
+          # Pin ONE exact commit so all three platform jobs build identical code (and the
+          # changelog is read from that same commit). Blank ref -> resolve the branch tip once.
+          if [ -z "$REF" ]; then
+            REF=$(gh api "repos/$REPO/commits/$BRANCH" --jq .sha 2>/dev/null || true)
+            [ -n "$REF" ] || { echo "::error::cannot resolve $REPO@$BRANCH to a commit"; exit 1; }
           fi
+
+          # The plugin's VERSION file (at the pinned commit) is the source of truth.
+          FILE_VERSION=$(gh api "repos/$REPO/contents/VERSION?ref=$REF" \
+            -H "Accept: application/vnd.github.raw" 2>/dev/null | tr -d '[:space:]' || true)
+          FILE_VERSION="${FILE_VERSION#v}"
+          VERSION="${VERSION#v}"
+          if [ -n "$VERSION" ]; then
+            # A tag/explicit version MUST match the committed VERSION file, or the installer
+            # metadata + update manifest disagree with what the binary reports (perpetual
+            # "update available" nag). Fail before spending any build minutes.
+            if [ -n "$FILE_VERSION" ] && [ "$VERSION" != "$FILE_VERSION" ]; then
+              echo "::error::version $VERSION != $REPO VERSION file ($FILE_VERSION) at ${REF:0:12} — bump VERSION and re-tag"
+              exit 1
+            fi
+          else
+            [ -n "$FILE_VERSION" ] \
+              || { echo "::error::no version given and $REPO has no readable VERSION file"; exit 1; }
+            VERSION="$FILE_VERSION"
+          fi
+
+          GATED=$(jq -r --arg p "$PLUGIN" '.[$p].gated // false' plugins.json)
 
           if jq -e --arg p "$PLUGIN" '.[$p].webBuild != null' plugins.json >/dev/null; then
             HAS_WEB=true
@@ -119,6 +155,7 @@ jobs:
           {
             echo "plugin=$PLUGIN"
             echo "version=$VERSION"
+            echo "ref=$REF"
             echo "repo=$REPO"
             echo "branch=$BRANCH"
             echo "target=$(get '.target')"
@@ -129,16 +166,18 @@ jobs:
             echo "downloadBaseUrl=$(get '.downloadBaseUrl')"
             echo "cdnBaseUrl=$(get '.cdnBaseUrl')"
             echo "manifestPath=$(get '.manifestPath')"
+            echo "gated=$GATED"
             echo "hasWeb=$HAS_WEB"
             echo "webDir=$WEB_DIR"
             echo "usesWebplugUi=$USES_WEBPLUG"
-            echo "publishManifest=$PUBLISH"
+            echo "dryRun=$DRY_RUN"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Releasing $PLUGIN v$VERSION from $REPO@$BRANCH"
+          MODE=$([ "$DRY_RUN" = "true" ] && echo "DRY-RUN (no publish)" || echo "PUBLISH")
+          echo "$MODE: $PLUGIN v$VERSION from $REPO @ ${REF:0:12} (gated=$GATED)"
 
   # --------------------------------------------------------------------------
-  # macOS: build universal, sign, notarize, staple, build signed .pkg.
+  # macOS: build universal, then (publish only) sign, notarize, staple.
   # --------------------------------------------------------------------------
   build-macos:
     needs: setup
@@ -155,6 +194,7 @@ jobs:
           plugin: ${{ needs.setup.outputs.plugin }}
           repo: ${{ needs.setup.outputs.repo }}
           branch: ${{ needs.setup.outputs.branch }}
+          ref: ${{ needs.setup.outputs.ref }}
           token: ${{ secrets.PLUGINS_CI_TOKEN }}
 
       - name: Setup Bun
@@ -179,8 +219,9 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
           cmake --build "$PDIR/build" --config Release --parallel
 
-      - name: Package signed .pkg
+      - name: Package .pkg (signed + notarized on publish)
         env:
+          DRY_RUN: ${{ needs.setup.outputs.dryRun }}
           PLUGIN: ${{ needs.setup.outputs.plugin }}
           TARGET: ${{ needs.setup.outputs.target }}
           PRODUCT: ${{ needs.setup.outputs.product }}
@@ -208,6 +249,9 @@ jobs:
           cp -R "$VST3" "$PKG_ROOT/Library/Audio/Plug-Ins/VST3/"
           [ -d "$AU" ] && cp -R "$AU" "$PKG_ROOT/Library/Audio/Plug-Ins/Components/"
 
+          # Both modes SIGN (so cert / keychain rot is caught on every push). Only a real
+          # publish also NOTARIZES + staples — the multi-minute notary wait is skipped on
+          # dry-runs. Signing needs the Apple secrets; without them we build unsigned + warn.
           SIGNED=false
           if [ -n "${APPLE_CERTIFICATE_APPLICATION:-}" ]; then
             SIGNED=true
@@ -231,32 +275,38 @@ jobs:
               codesign --force --deep --sign "$APP_IDENTITY" --options runtime --timestamp \
                 "$PKG_ROOT/Library/Audio/Plug-Ins/Components/${PRODUCT}.component"
 
-            xcrun notarytool store-credentials "notarytool-profile" \
-              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+            if [ "$DRY_RUN" != "true" ]; then
+              xcrun notarytool store-credentials "notarytool-profile" \
+                --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+            fi
           else
             echo "::warning::No Apple signing secrets — building an UNSIGNED .pkg"
           fi
 
-          OUT="$PKG_OUT/${TARGET}-${VERSION}-macOS.pkg"
+          OUT="$PKG_OUT/${TARGET}-macOS-${VERSION}.pkg"
           if [ "$SIGNED" = true ]; then
             pkgbuild --root "$PKG_ROOT" --identifier "${BUNDLE_ID}.pkg" --version "$VERSION" \
               --install-location "/" "$PKG_OUT/unsigned.pkg"
             productsign --sign "$PKG_IDENTITY" "$PKG_OUT/unsigned.pkg" "$OUT"
             rm "$PKG_OUT/unsigned.pkg"
-            xcrun notarytool submit "$OUT" --keychain-profile "notarytool-profile" --wait
-            xcrun stapler staple "$OUT"
+            if [ "$DRY_RUN" != "true" ]; then
+              xcrun notarytool submit "$OUT" --keychain-profile "notarytool-profile" --wait
+              xcrun stapler staple "$OUT"
+            else
+              echo "dry-run: signed but NOT notarized"
+            fi
           else
-            OUT="$PKG_OUT/${TARGET}-${VERSION}-macOS-UNSIGNED.pkg"
             pkgbuild --root "$PKG_ROOT" --identifier "${BUNDLE_ID}.pkg" --version "$VERSION" \
               --install-location "/" "$OUT"
           fi
           echo "built $OUT"
 
-      # Publish straight to R2. We deliberately DO NOT use upload-artifact: on a
-      # public hub repo, run artifacts are publicly downloadable, and these are
-      # paid-plugin builds. R2 (private, served only via the gated CDN) is the one
-      # and only place a build is downloadable.
-      - name: Upload macOS build to R2
+      # Publish only: stash the build under a private, per-run staging prefix in R2.
+      # The build is NOT promoted to a live key here — the publish job does that, and
+      # only once every platform has succeeded. We never use upload-artifact (public
+      # hub run artifacts are downloadable; these are paid-plugin builds).
+      - name: Stage macOS build to R2
+        if: needs.setup.outputs.dryRun != 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -268,15 +318,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
-            echo "::error::R2 secrets not set — cannot publish the build"; exit 1
+            echo "::error::R2 secrets not set — cannot stage the build"; exit 1
           fi
-          PKG=$(ls build/installer/*.pkg)
-          VNAME="${TARGET}-macOS-${VERSION}.pkg"          # versioned filename
-          VER="$PREFIX/$VNAME"                             # explicit-version link
-          LATEST="$PREFIX/${TARGET}-macOS.pkg"             # stable "latest" link (downloads as $VNAME)
-          aws s3 cp "$PKG" "s3://$BUCKET/$VER"    --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          aws s3 cp "$PKG" "s3://$BUCKET/$LATEST" --content-disposition "attachment; filename=$VNAME" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          echo "uploaded s3://$BUCKET/$VER (+ latest as $VNAME)"
+          VNAME="${TARGET}-macOS-${VERSION}.pkg"
+          aws s3 cp "build/installer/$VNAME" \
+            "s3://$BUCKET/$PREFIX/_staging/${{ github.run_id }}/$VNAME" \
+            --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          echo "staged $VNAME"
 
   # --------------------------------------------------------------------------
   # Windows: build x64, then Inno Setup installer. (Unsigned — see README TODO.)
@@ -296,6 +344,7 @@ jobs:
           plugin: ${{ needs.setup.outputs.plugin }}
           repo: ${{ needs.setup.outputs.repo }}
           branch: ${{ needs.setup.outputs.branch }}
+          ref: ${{ needs.setup.outputs.ref }}
           token: ${{ secrets.PLUGINS_CI_TOKEN }}
 
       - name: Setup Bun
@@ -341,7 +390,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path installer-out | Out-Null
           Get-ChildItem -Path $issDir -Filter *.exe | Copy-Item -Destination installer-out
 
-      - name: Upload Windows build to R2
+      - name: Stage Windows build to R2
+        if: needs.setup.outputs.dryRun != 'true'
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -354,15 +404,14 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
-            echo "::error::R2 secrets not set — cannot publish the build"; exit 1
+            echo "::error::R2 secrets not set — cannot stage the build"; exit 1
           fi
           EXE=$(ls installer-out/*.exe | head -1)
           VNAME="${TARGET}-Windows-${VERSION}.exe"
-          VER="$PREFIX/$VNAME"
-          LATEST="$PREFIX/${TARGET}-Windows.exe"           # stable "latest" link (downloads as $VNAME)
-          aws s3 cp "$EXE" "s3://$BUCKET/$VER"    --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          aws s3 cp "$EXE" "s3://$BUCKET/$LATEST" --content-disposition "attachment; filename=$VNAME" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          echo "uploaded s3://$BUCKET/$VER (+ latest as $VNAME)"
+          aws s3 cp "$EXE" \
+            "s3://$BUCKET/$PREFIX/_staging/${{ github.run_id }}/$VNAME" \
+            --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          echo "staged $VNAME"
 
   # --------------------------------------------------------------------------
   # Linux: build Release, zip the plugin bundles.
@@ -388,6 +437,7 @@ jobs:
           plugin: ${{ needs.setup.outputs.plugin }}
           repo: ${{ needs.setup.outputs.repo }}
           branch: ${{ needs.setup.outputs.branch }}
+          ref: ${{ needs.setup.outputs.ref }}
           token: ${{ secrets.PLUGINS_CI_TOKEN }}
 
       - name: Setup Bun
@@ -424,10 +474,15 @@ jobs:
           for fmt in VST3 LV2 CLAP Standalone; do
             [ -d "$ART/$fmt" ] && cp -R "$ART/$fmt" "staged/" || true
           done
-          ( cd staged && zip -r "../out/${TARGET}-${VERSION}-Linux-x64.zip" . )
+          # VST3 is the baseline format every Dichotic plugin ships — refuse to package a
+          # zip without it (guards against a CMake regression silently shipping e.g. only
+          # a Standalone).
+          [ -d "staged/VST3" ] || { echo "::error::Linux build produced no VST3 (formats present: $(ls staged || echo none))"; exit 1; }
+          ( cd staged && zip -r "../out/${TARGET}-Linux-x64-${VERSION}.zip" . )
           ls -la out
 
-      - name: Upload Linux build to R2
+      - name: Stage Linux build to R2
+        if: needs.setup.outputs.dryRun != 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -439,70 +494,210 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
-            echo "::error::R2 secrets not set — cannot publish the build"; exit 1
+            echo "::error::R2 secrets not set — cannot stage the build"; exit 1
           fi
-          ZIP=$(ls out/*.zip)
           VNAME="${TARGET}-Linux-x64-${VERSION}.zip"
-          VER="$PREFIX/$VNAME"
-          LATEST="$PREFIX/${TARGET}-Linux-x64.zip"         # stable "latest" link (downloads as $VNAME)
-          aws s3 cp "$ZIP" "s3://$BUCKET/$VER"    --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          aws s3 cp "$ZIP" "s3://$BUCKET/$LATEST" --content-disposition "attachment; filename=$VNAME" --endpoint-url "$AWS_ENDPOINT_URL" --region auto
-          echo "uploaded s3://$BUCKET/$VER (+ latest as $VNAME)"
+          aws s3 cp "out/$VNAME" \
+            "s3://$BUCKET/$PREFIX/_staging/${{ github.run_id }}/$VNAME" \
+            --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          echo "staged $VNAME"
 
   # --------------------------------------------------------------------------
-  # Finalize: the builds are already in R2 (uploaded by each platform job).
-  # This job just publishes the update manifest to the site and prints the
-  # CDN URLs. The hub NEVER writes to the plugin repos (Read-only token) and
-  # NEVER produces a public artifact — R2, served via the gated CDN, is the
-  # one and only download source.
+  # Publish (publish mode only, and only if ALL THREE builds passed):
+  #   promote staged builds -> live CDN keys -> cut the GitHub release on the
+  #   PLUGIN repo -> publish the plugin's changelog + update manifest to the site.
+  # This is the atomic gate: a single failed platform means this never runs.
   # --------------------------------------------------------------------------
-  finalize:
+  publish:
     needs: [setup, build-macos, build-windows, build-linux]
+    if: needs.setup.outputs.dryRun != 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Summarize what landed in R2
+      - name: Checkout hub
+        uses: actions/checkout@v4
+        with: { submodules: false }
+
+      - name: Download staged builds from R2
         env:
-          PLUGIN: ${{ needs.setup.outputs.plugin }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ env.R2_ENDPOINT }}
+          BUCKET: ${{ needs.setup.outputs.r2Bucket }}
+          PREFIX: ${{ needs.setup.outputs.plugin }}
           TARGET: ${{ needs.setup.outputs.target }}
           VERSION: ${{ needs.setup.outputs.version }}
-          CDN: ${{ needs.setup.outputs.cdnBaseUrl }}
         run: |
-          echo "Builds published to R2 under $PLUGIN/:"
-          echo "  $TARGET-macOS-$VERSION.pkg (+ $TARGET-macOS.pkg, downloads versioned)"
-          echo "  $TARGET-Windows-$VERSION.exe (+ $TARGET-Windows.exe, downloads versioned)"
-          echo "  $TARGET-Linux-x64-$VERSION.zip (+ $TARGET-Linux-x64.zip, downloads versioned)"
-          [ -n "${CDN:-}" ] && echo "CDN latest: $CDN/$TARGET-macOS.pkg etc."
+          set -euo pipefail
+          mkdir -p staged
+          aws s3 cp "s3://$BUCKET/$PREFIX/_staging/${{ github.run_id }}/" staged/ \
+            --recursive --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+          # Assert every platform artifact is present before we publish anything.
+          for f in "${TARGET}-macOS-${VERSION}.pkg" "${TARGET}-Windows-${VERSION}.exe" "${TARGET}-Linux-x64-${VERSION}.zip"; do
+            [ -f "staged/$f" ] || { echo "::error::staged artifact missing: $f"; exit 1; }
+          done
+          ls -la staged
 
-      - name: Publish update manifest to the site
-        if: needs.setup.outputs.publishManifest == 'true' && needs.setup.outputs.downloadBaseUrl != ''
+      # Validate + generate EVERYTHING before we touch a single live key. If the
+      # plugin's CHANGELOG.md has no section for this version, we fail here — while
+      # the live CDN keys still point at the previous release.
+      - name: Fetch the plugin's CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ secrets.PLUGINS_CI_TOKEN }}
+          REPO: ${{ needs.setup.outputs.repo }}
+          REF: ${{ needs.setup.outputs.ref }}
+          BRANCH: ${{ needs.setup.outputs.branch }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/contents/CHANGELOG.md?ref=${REF:-$BRANCH}" \
+            -H "Accept: application/vnd.github.raw" > CHANGELOG.md \
+            || { echo "::error::$REPO has no readable CHANGELOG.md at ${REF:-$BRANCH} (the site changelog is generated from it)"; exit 1; }
+
+      - name: Generate changelog + manifest, clone site
         env:
           SSH_KEY: ${{ secrets.SITE_DEPLOY_SSH_KEY }}
-          MANIFEST_PATH: ${{ needs.setup.outputs.manifestPath }}
-          VERSION: ${{ needs.setup.outputs.version }}
-          URL: ${{ needs.setup.outputs.downloadBaseUrl }}
           PLUGIN: ${{ needs.setup.outputs.plugin }}
+          REPO: ${{ needs.setup.outputs.repo }}
+          TARGET: ${{ needs.setup.outputs.target }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          GATED: ${{ needs.setup.outputs.gated }}
+          MANIFEST_PATH: ${{ needs.setup.outputs.manifestPath }}
+          URL: ${{ needs.setup.outputs.downloadBaseUrl }}
         run: |
           set -euo pipefail
           if [ -z "${SSH_KEY:-}" ]; then
-            echo "::warning::SITE_DEPLOY_SSH_KEY not set, skipping manifest publish"; exit 0
+            echo "::error::SITE_DEPLOY_SSH_KEY not set — cannot publish to the site"; exit 1
           fi
-          # Auth to the site repo with a write-scoped SSH deploy key (not a PAT). The site is a
-          # Git-connected Cloudflare Pages project, so this push auto-deploys to dichoticstudios.com.
           mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
           printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/site_deploy"
           chmod 600 "$HOME/.ssh/site_deploy"
           ssh-keyscan github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/site_deploy -o IdentitiesOnly=yes"
           git clone --depth 1 git@github.com:noahbaxter/dichoticstudios.com.git site
+
+          gated_flag=""
+          [ "$GATED" = "true" ] && gated_flag="--gated"
+          # Fails (non-zero) if CHANGELOG.md has no heading for $VERSION — before any promote.
+          python3 scripts/changelog-entry.py \
+            --changelog CHANGELOG.md \
+            --out "site/static/changelogs/$PLUGIN.json" \
+            --version "$VERSION" --repo "$REPO" --target "$TARGET" \
+            --date "$(date -u +%Y-%m-%d)" --notes-out release-notes.md $gated_flag
+
+          mkdir -p "site/$(dirname "$MANIFEST_PATH")"
+          printf '{\n  "version": "%s",\n  "url": "%s"\n}\n' "$VERSION" "$URL" > "site/$MANIFEST_PATH"
+
+      # Only now, with the changelog validated and the site commit staged locally, do
+      # we overwrite live keys. Everything below is idempotent, so a network failure
+      # mid-publish is fixed by re-running (cleanup keeps staging on publish failure).
+      - name: Promote staged builds to live CDN keys
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ env.R2_ENDPOINT }}
+          BUCKET: ${{ needs.setup.outputs.r2Bucket }}
+          PREFIX: ${{ needs.setup.outputs.plugin }}
+          TARGET: ${{ needs.setup.outputs.target }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          # For each platform: publish a versioned key AND a stable "latest" key
+          # (the latest key downloads as the versioned filename via content-disposition).
+          promote() {
+            local vname="$1" latest="$2"
+            aws s3 cp "staged/$vname" "s3://$BUCKET/$PREFIX/$vname" \
+              --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+            aws s3 cp "staged/$vname" "s3://$BUCKET/$PREFIX/$latest" \
+              --content-disposition "attachment; filename=$vname" \
+              --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+            echo "promoted $vname (+ latest $latest)"
+          }
+          promote "${TARGET}-macOS-${VERSION}.pkg"     "${TARGET}-macOS.pkg"
+          promote "${TARGET}-Windows-${VERSION}.exe"   "${TARGET}-Windows.exe"
+          promote "${TARGET}-Linux-x64-${VERSION}.zip" "${TARGET}-Linux-x64.zip"
+
+      - name: Cut the GitHub release on the plugin repo
+        env:
+          GH_TOKEN: ${{ secrets.PLUGINS_CI_TOKEN }}
+          REPO: ${{ needs.setup.outputs.repo }}
+          BRANCH: ${{ needs.setup.outputs.branch }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          GATED: ${{ needs.setup.outputs.gated }}
+        run: |
+          set -euo pipefail
+          TAG="v$VERSION"
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" -R "$REPO" --title "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" -R "$REPO" --target "$BRANCH" --title "$TAG" --notes-file release-notes.md
+          fi
+          # Gated plugins (paid) never get public binaries — downloads stay CDN-gated.
+          if [ "$GATED" != "true" ]; then
+            gh release upload "$TAG" -R "$REPO" staged/* --clobber
+            echo "attached $(ls staged | wc -l | tr -d ' ') assets to $REPO $TAG"
+          else
+            echo "gated plugin: released $TAG with notes only (no public binaries)"
+          fi
+
+      - name: Publish changelog + manifest to the site
+        env:
+          PLUGIN: ${{ needs.setup.outputs.plugin }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/site_deploy -o IdentitiesOnly=yes"
           cd site
-          mkdir -p "$(dirname "$MANIFEST_PATH")"
-          printf '{\n  "version": "%s",\n  "url": "%s"\n}\n' "$VERSION" "$URL" > "$MANIFEST_PATH"
           git config user.name "dichotic-plugins bot"
           git config user.email "noahbaxt@gmail.com"
-          if git diff --quiet; then
-            echo "manifest already up to date"; exit 0
+          git add "static/changelogs/$PLUGIN.json" "static/updates/$PLUGIN.json"
+          if git diff --cached --quiet; then
+            echo "site already up to date for $PLUGIN v$VERSION"; exit 0
           fi
-          git add "$MANIFEST_PATH"
           git commit -m "Update $PLUGIN to v$VERSION"
-          git push
-          echo "published $MANIFEST_PATH -> version $VERSION"
+          # Another plugin's publish may have pushed to the site between our clone and
+          # now; rebase our single commit onto the tip and retry rather than fail.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "published site changelog + manifest for $PLUGIN v$VERSION"; exit 0
+            fi
+            echo "site push rejected (attempt $attempt) — rebasing onto origin/main"
+            git pull --rebase origin main
+          done
+          echo "::error::could not push site update after retries"; exit 1
+
+      - name: Summary
+        env:
+          PLUGIN: ${{ needs.setup.outputs.plugin }}
+          TARGET: ${{ needs.setup.outputs.target }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          CDN: ${{ needs.setup.outputs.cdnBaseUrl }}
+        run: |
+          echo "Published $PLUGIN v$VERSION:"
+          echo "  CDN latest: $CDN/$TARGET-macOS.pkg (+ Windows.exe, Linux-x64.zip)"
+          echo "  GitHub release + site changelog/manifest updated."
+
+  # --------------------------------------------------------------------------
+  # Wipe this run's staging prefix — EXCEPT when publish itself failed, so that a
+  # "Re-run failed jobs" of the publish job still finds the staged builds (every
+  # publish step is idempotent). Runs on publish success and on build failure
+  # (publish skipped) to clean partial staging.
+  # --------------------------------------------------------------------------
+  cleanup:
+    needs: [setup, build-macos, build-windows, build-linux, publish]
+    if: always() && needs.setup.outputs.dryRun != 'true' && needs.publish.result != 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove staging prefix
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ env.R2_ENDPOINT }}
+          BUCKET: ${{ needs.setup.outputs.r2Bucket }}
+          PREFIX: ${{ needs.setup.outputs.plugin }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "no R2 secrets; nothing to clean"; exit 0
+          fi
+          aws s3 rm "s3://$BUCKET/$PREFIX/_staging/${{ github.run_id }}/" \
+            --recursive --endpoint-url "$AWS_ENDPOINT_URL" --region auto || true
+          echo "cleaned staging for run ${{ github.run_id }}"

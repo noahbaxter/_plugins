@@ -14,6 +14,10 @@ inputs:
     description: Branch to track
     required: true
     default: main
+  ref:
+    description: Exact commit SHA to check out (blank = branch tip)
+    required: false
+    default: ""
   token:
     description: PLUGINS_CI_TOKEN (Contents:Read on all plugin repos + webplug-ui)
     required: true
@@ -33,6 +37,7 @@ runs:
         GH_TOKEN: ${{ inputs.token }}
         PLUGIN: ${{ inputs.plugin }}
         REPO: ${{ inputs.repo }}
+        REF: ${{ inputs.ref }}
       run: |
         set -euo pipefail
         if [ -z "${GH_TOKEN:-}" ]; then
@@ -53,11 +58,19 @@ runs:
         for prefix in "git@github.com:" "git+ssh://git@github.com/" "ssh://git@github.com/"; do
           git config --global url."https://github.com/".insteadOf "$prefix"
         done
-        # --remote (no --recursive) moves ONLY the plugin submodule to its branch
-        # tip; then a plain recursive update checks out the plugin's OWN pinned
-        # nested submodules (e.g. JUCE at the commit the plugin records, not
-        # JUCE's branch tip). --remote --recursive would wrongly bump those pins.
-        git submodule update --remote --init "plugins/$PLUGIN"
+        # Move the plugin submodule to the exact commit to build. With REF set (a
+        # release/dispatch always passes github.sha), check out that SHA so every
+        # platform job builds identical code; blank REF falls back to the branch tip.
+        # Either way, a plain recursive update then checks out the plugin's OWN pinned
+        # nested submodules (e.g. JUCE at the commit the plugin records) — never their
+        # branch tips, which --remote --recursive would wrongly bump.
+        git submodule update --init "plugins/$PLUGIN"
+        if [ -n "${REF:-}" ]; then
+          git -C "plugins/$PLUGIN" fetch --depth 1 origin "$REF"
+          git -C "plugins/$PLUGIN" checkout --detach FETCH_HEAD
+        else
+          git submodule update --remote "plugins/$PLUGIN"
+        fi
         git -C "plugins/$PLUGIN" submodule update --init --recursive
         # Pull LFS content (e.g. baked sprite PNGs) inside the plugin checkout.
         git -C "plugins/$PLUGIN" lfs install --local >/dev/null 2>&1 || true

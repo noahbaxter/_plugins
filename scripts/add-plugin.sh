@@ -43,25 +43,89 @@ else
       target: "TODO_CMAKE_TARGET",
       productName: "TODO_PRODUCT_NAME",
       bundleId: "com.dichoticstudios.\($n)",
-      r2Bucket: "vst-\($n)",
-      windowsInstaller: "scripts/installer/windows/installer.iss",
-      downloadBaseUrl: "https://dichoticstudios.com",
+      gated: false,
+      r2Bucket: "dichotic-plugins",
+      cdnBaseUrl: "https://cdn.dichoticstudios.com/\($n)",
+      windowsInstaller: "installer/windows/installer.iss",
+      downloadBaseUrl: "https://dichoticstudios.com/download/\($n)",
       manifestPath: "static/updates/\($n).json",
       webBuild: null
     }' plugins.json > "$tmp" && mv "$tmp" plugins.json
 fi
 
+# Scaffold the plugin repo's trigger workflow (push main -> hub dry-run, tag -> publish).
+# Written into the submodule working tree; commit + push it to the plugin repo, then
+# set its HUB_DISPATCH_TOKEN secret (see the TODO below).
+DISPATCH="$SUB_PATH/.github/workflows/release-dispatch.yml"
+if [ -f "$DISPATCH" ]; then
+  echo "$DISPATCH already exists — leaving it untouched"
+else
+  echo "scaffolding $DISPATCH"
+  mkdir -p "$(dirname "$DISPATCH")"
+  cat > "$DISPATCH" <<YAML
+name: Dispatch release to hub
+
+# The Dichotic plugins hub (noahbaxter/_plugins) does all the building, signing,
+# CDN upload, GitHub release, and site publishing. This repo only tells it when:
+#   - push to main -> hub dry-run (build all platforms, publish nothing)
+#   - push a tag vX.Y.Z -> hub publish (build + release + CDN + site)
+#
+# Needs a HUB_DISPATCH_TOKEN secret: a fine-grained PAT with Actions: read/write
+# on noahbaxter/_plugins.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+concurrency:
+  group: hub-dispatch-\${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fire the hub release workflow
+        env:
+          GH_TOKEN: \${{ secrets.HUB_DISPATCH_TOKEN }}
+          PLUGIN: $NAME
+        run: |
+          set -euo pipefail
+          if [ "\$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="\${GITHUB_REF_NAME#v}"
+            echo "tag \$GITHUB_REF_NAME (\$GITHUB_SHA) -> publish \$PLUGIN v\$VERSION"
+            gh workflow run release.yml -R noahbaxter/_plugins \\
+              -f plugin="\$PLUGIN" -f version="\$VERSION" -f ref="\$GITHUB_SHA" -f dry_run=false
+          else
+            echo "push to \$GITHUB_REF_NAME (\$GITHUB_SHA) -> dry-run build \$PLUGIN"
+            gh workflow run release.yml -R noahbaxter/_plugins \\
+              -f plugin="\$PLUGIN" -f ref="\$GITHUB_SHA" -f dry_run=true
+          fi
+YAML
+fi
+
 cat <<EOF
 
-Done. Still TODO for '$NAME' (read $SUB_PATH/CMakeLists.txt):
+Done. Still TODO for '$NAME':
+
+1. Fill in plugins.json (read $SUB_PATH/CMakeLists.txt):
   - target            CMake target name (build/<target>_artefacts/...)
   - productName       bundle basename, e.g. "Guillotine Clip" (may differ from target)
   - bundleId          confirm com.dichoticstudios.<...>
-  - r2Bucket          confirm the R2 bucket exists
-  - windowsInstaller  path to the .iss (pewpew: scripts/installer/windows, guillotine: installer/windows)
+  - gated             true for paid plugins (no public release binaries; CDN only)
+  - windowsInstaller  path to the .iss (guillotine: installer/windows/installer.iss)
   - downloadBaseUrl   public URL for the update manifest's "url" field
   - webBuild          null, or { "dir": "web", "usesWebplugUi": true|false }
+  (r2Bucket + cdnBaseUrl are seeded to the shared dichotic-plugins CDN.)
 
-Also add '$NAME' to the workflow_dispatch 'plugin' choice list in
-.github/workflows/release.yml so you can pick it from the Actions UI.
+2. Add '$NAME' to the workflow_dispatch 'plugin' choice list in
+   .github/workflows/release.yml so you can pick it from the Actions UI.
+
+3. The plugin repo needs a CHANGELOG.md (the site changelog is generated from it,
+   with '## [x.y.z] - date' or '## x.y.z' headings per release).
+
+4. Commit + push the scaffolded $DISPATCH to $REPO, then give it the dispatch token:
+     gh secret set HUB_DISPATCH_TOKEN -R $REPO < token.txt
+   (the same fine-grained PAT used for PLUGINS_CI_TOKEN — Actions: read/write on _plugins).
 EOF

@@ -5,6 +5,7 @@
     "target": "PewPew",
     "productName": "PewPew",
     "bundleId": "com.dichoticstudios.pewpew",
+    "gated": true,
     "r2Bucket": "dichotic-plugins",
     "cdnBaseUrl": "https://cdn.dichoticstudios.com/pewpew",
     "windowsInstaller": "scripts/installer/windows/installer.iss",
