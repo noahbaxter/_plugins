@@ -10,3 +10,7 @@
 	path = plugins/chartchotic
 	url = https://github.com/noahbaxter/chartchotic.git
 	branch = main
+[submodule "plugins/genericaudioplugin"]
+	path = plugins/genericaudioplugin
+	url = https://github.com/noahbaxter/GenericAudioPlugin.git
+	branch = main

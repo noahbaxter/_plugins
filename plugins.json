@@ -41,5 +41,19 @@
     "downloadBaseUrl": "https://dichoticstudios.com/download/chartchotic",
     "manifestPath": "static/updates/chartchotic.json",
     "webBuild": null
+  },
+  "genericaudioplugin": {
+    "repo": "noahbaxter/GenericAudioPlugin",
+    "branch": "main",
+    "target": "AudioPlugin",
+    "productName": "Audio Plugin",
+    "bundleId": "com.dichoticstudios.genericaudioplugin",
+    "gated": false,
+    "r2Bucket": "dichotic-plugins",
+    "cdnBaseUrl": "https://cdn.dichoticstudios.com/genericaudioplugin",
+    "windowsInstaller": "installer/windows/installer.iss",
+    "downloadBaseUrl": "https://dichoticstudios.com/download/genericaudioplugin",
+    "manifestPath": "static/updates/genericaudioplugin.json",
+    "webBuild": { "dir": "web", "usesWebplugUi": false }
   }
 }
