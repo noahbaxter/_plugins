@@ -27,6 +27,7 @@ on:
           - pewpew
           - guillotine
           - chartchotic
+          - genericaudioplugin
       version:
         description: Version (blank = read the plugin's VERSION file)
         required: false
