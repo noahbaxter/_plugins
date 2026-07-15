@@ -54,6 +54,6 @@
     "windowsInstaller": "installer/windows/installer.iss",
     "downloadBaseUrl": "https://dichoticstudios.com/download/genericaudioplugin",
     "manifestPath": "static/updates/genericaudioplugin.json",
-    "webBuild": { "dir": "web", "usesWebplugUi": false }
+    "webBuild": null
   }
 }
