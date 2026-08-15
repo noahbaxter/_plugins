@@ -1,0 +1,18 @@
+{
+  "_comment": "Projects that build and release themselves, and only need the CDN + site half of the pipeline. Driven by .github/workflows/publish-external.yml. JUCE plugins belong in plugins.json instead.",
+
+  "stemchotic": {
+    "repo": "noahbaxter/stemchotic",
+    "target": "Stemchotic",
+    "r2Bucket": "dichotic-plugins",
+    "cdnPrefix": "stemchotic",
+    "cdnBaseUrl": "https://cdn.dichoticstudios.com/stemchotic",
+    "downloadBaseUrl": "https://dichoticstudios.com/download/stemchotic",
+    "manifestPath": "static/updates/stemchotic.json",
+    "assets": {
+      "macos":   { "release": "Stemchotic.dmg", "versioned": "Stemchotic-macOS-{v}.dmg",   "latest": "Stemchotic-macOS.dmg" },
+      "windows": { "release": "Stemchotic.exe", "versioned": "Stemchotic-Windows-{v}.exe", "latest": "Stemchotic-Windows.exe" },
+      "linux":   { "release": "Stemchotic",     "versioned": "Stemchotic-Linux-{v}",       "latest": "Stemchotic-Linux" }
+    }
+  }
+}
