@@ -1,0 +1,253 @@
+name: Publish external release
+
+# The CDN + site half of release.yml, for projects that build and release themselves.
+# Driven by external.json.
+#
+# release.yml can't do this without skipping its own build jobs, which four plugins
+# depend on, so this runs the tail against an existing GitHub release instead.
+#
+# Secrets stay here. A project in external.json holds no R2 key and triggers nothing;
+# the poll below notices its releases.
+
+on:
+  schedule:
+    - cron: '20 7 * * *'   # daily, catches any release the poll hasn't published yet
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Key in external.json
+        required: true
+        default: stemchotic
+      version:
+        description: Version to publish (blank = the repo's latest release)
+        required: false
+      dry_run:
+        description: Resolve and validate, but touch no live keys and push nothing
+        type: boolean
+        default: false
+
+env:
+  R2_ENDPOINT: https://ee4f7641599153d817b6bddbea5483e7.r2.cloudflarestorage.com
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Scheduled runs sweep every project; a dispatch narrows to one below.
+        project: [stemchotic]
+    steps:
+      - name: Checkout hub
+        uses: actions/checkout@v4
+        with: { submodules: false }
+
+      - name: Resolve project + version
+        id: cfg
+        env:
+          GH_TOKEN: ${{ secrets.PLUGINS_CI_TOKEN }}
+          MATRIX_PROJECT: ${{ matrix.project }}
+          INPUT_PROJECT: ${{ github.event.inputs.project }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          PROJECT="${INPUT_PROJECT:-$MATRIX_PROJECT}"
+          if [ -n "${INPUT_PROJECT:-}" ] && [ "$INPUT_PROJECT" != "$MATRIX_PROJECT" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "dispatch targeted $INPUT_PROJECT, this matrix leg is $MATRIX_PROJECT"
+            exit 0
+          fi
+
+          jq -e --arg p "$PROJECT" 'has($p)' external.json >/dev/null \
+            || { echo "::error::'$PROJECT' not found in external.json"; exit 1; }
+          get() { jq -r --arg p "$PROJECT" ".[\$p]$1 // empty" external.json; }
+
+          REPO="$(get '.repo')"
+          VERSION="${INPUT_VERSION:-}"
+          if [ -z "$VERSION" ]; then
+            VERSION="$(gh release view -R "$REPO" --json tagName -q .tagName)"
+          fi
+          VERSION="${VERSION#v}"
+          # The release's own publish date, not today's: re-running or backfilling an
+          # older version must not restamp it with the date of the re-run.
+          RELEASED="$(gh release view "v$VERSION" -R "$REPO" --json publishedAt -q '.publishedAt[0:10]')"
+
+          {
+            echo "skip=false"
+            echo "project=$PROJECT"
+            echo "repo=$REPO"
+            echo "version=$VERSION"
+            echo "released=$RELEASED"
+            echo "target=$(get '.target')"
+            echo "bucket=$(get '.r2Bucket')"
+            echo "prefix=$(get '.cdnPrefix')"
+            echo "cdnBaseUrl=$(get '.cdnBaseUrl')"
+            echo "downloadBaseUrl=$(get '.downloadBaseUrl')"
+            echo "manifestPath=$(get '.manifestPath')"
+            echo "assets=$(jq -c --arg p "$PROJECT" '.[$p].assets' external.json)"
+          } >> "$GITHUB_OUTPUT"
+          echo "resolved $PROJECT v$VERSION from $REPO"
+
+      # Clone first so we can bail before downloading anything if the site already
+      # has this version. That is what makes the daily poll almost always a no-op.
+      - name: Clone site and check whether this version is already published
+        id: site
+        if: steps.cfg.outputs.skip != 'true'
+        env:
+          SSH_KEY: ${{ secrets.SITE_DEPLOY_SSH_KEY }}
+          PROJECT: ${{ steps.cfg.outputs.project }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+          MANIFEST_PATH: ${{ steps.cfg.outputs.manifestPath }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSH_KEY:-}" ]; then
+            echo "::error::SITE_DEPLOY_SSH_KEY not set — cannot publish to the site"; exit 1
+          fi
+          mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/site_deploy"
+          chmod 600 "$HOME/.ssh/site_deploy"
+          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/site_deploy -o IdentitiesOnly=yes"
+          git clone --depth 1 git@github.com:noahbaxter/dichoticstudios.com.git site
+
+          CURRENT="$(jq -r '.version // empty' "site/$MANIFEST_PATH" 2>/dev/null || true)"
+          if [ "$CURRENT" = "$VERSION" ]; then
+            echo "uptodate=true" >> "$GITHUB_OUTPUT"
+            echo "site already publishes $PROJECT v$VERSION, nothing to do"
+          else
+            echo "uptodate=false" >> "$GITHUB_OUTPUT"
+            echo "site has '${CURRENT:-none}', release is '$VERSION'"
+          fi
+
+      - name: Download release assets
+        id: assets
+        if: steps.cfg.outputs.skip != 'true' && steps.site.outputs.uptodate != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PLUGINS_CI_TOKEN }}
+          REPO: ${{ steps.cfg.outputs.repo }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+          ASSETS: ${{ steps.cfg.outputs.assets }}
+        run: |
+          set -euo pipefail
+          mkdir -p staged
+          # Every platform must be present before anything is promoted, matching
+          # release.yml's all-or-nothing rule.
+          for os in $(echo "$ASSETS" | jq -r 'keys[]'); do
+            name="$(echo "$ASSETS" | jq -r --arg o "$os" '.[$o].release')"
+            gh release download "v$VERSION" -R "$REPO" -p "$name" -D staged --clobber
+            [ -f "staged/$name" ] || { echo "::error::missing asset $name in $REPO v$VERSION"; exit 1; }
+            echo "got $os -> $name"
+          done
+          # Map os -> release filename for the changelog's download links.
+          echo "$ASSETS" | jq -c 'map_values(.release)' > asset-names.json
+          ls -la staged
+
+      # Generate and validate everything before a single live key is touched. A
+      # CHANGELOG.md with no section for this version fails here, while the CDN
+      # still points at the previous release.
+      - name: Generate changelog + manifest
+        if: steps.cfg.outputs.skip != 'true' && steps.site.outputs.uptodate != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PLUGINS_CI_TOKEN }}
+          PROJECT: ${{ steps.cfg.outputs.project }}
+          REPO: ${{ steps.cfg.outputs.repo }}
+          TARGET: ${{ steps.cfg.outputs.target }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+          MANIFEST_PATH: ${{ steps.cfg.outputs.manifestPath }}
+          URL: ${{ steps.cfg.outputs.downloadBaseUrl }}
+          RELEASED: ${{ steps.cfg.outputs.released }}
+          CDN: ${{ steps.cfg.outputs.cdnBaseUrl }}
+          ASSETS: ${{ steps.cfg.outputs.assets }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/contents/CHANGELOG.md?ref=v$VERSION" \
+            -H "Accept: application/vnd.github.raw" > CHANGELOG.md \
+            || { echo "::error::$REPO has no readable CHANGELOG.md at v$VERSION"; exit 1; }
+
+          python3 scripts/changelog-entry.py \
+            --changelog CHANGELOG.md \
+            --out "site/static/changelogs/$PROJECT.json" \
+            --version "$VERSION" --repo "$REPO" --target "$TARGET" \
+            --date "$RELEASED" \
+            --asset-names "$(cat asset-names.json)"
+
+          mkdir -p "site/$(dirname "$MANIFEST_PATH")"
+          # Same shape release.yml writes: version, url, and the stable per-OS CDN "latest"
+          # URLs, so the site's download buttons track every release with no page edits.
+          # These are the same keys the promote step below overwrites.
+          DOWNLOADS="$(echo "$ASSETS" | jq --arg cdn "$CDN" 'map_values($cdn + "/" + .latest)')"
+          jq -n --arg v "$VERSION" --arg url "$URL" --argjson d "$DOWNLOADS" \
+            '{version: $v, url: $url, downloads: $d}' > "site/$MANIFEST_PATH"
+          echo "--- manifest ---"; cat "site/$MANIFEST_PATH"
+
+      - name: Promote to live CDN keys
+        if: steps.cfg.outputs.skip != 'true' && steps.site.outputs.uptodate != 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ env.R2_ENDPOINT }}
+          BUCKET: ${{ steps.cfg.outputs.bucket }}
+          PREFIX: ${{ steps.cfg.outputs.prefix }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+          ASSETS: ${{ steps.cfg.outputs.assets }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          for os in $(echo "$ASSETS" | jq -r 'keys[]'); do
+            src="staged/$(echo "$ASSETS" | jq -r --arg o "$os" '.[$o].release')"
+            vname="$(echo "$ASSETS" | jq -r --arg o "$os" --arg v "$VERSION" '.[$o].versioned | sub("\\{v\\}"; $v)')"
+            latest="$(echo "$ASSETS" | jq -r --arg o "$os" '.[$o].latest')"
+            if [ "${DRY_RUN:-false}" = "true" ]; then
+              echo "[dry-run] would promote $src -> $PREFIX/$vname (+ latest $latest)"
+              continue
+            fi
+            aws s3 cp "$src" "s3://$BUCKET/$PREFIX/$vname" \
+              --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+            # The stable key downloads as the versioned filename.
+            aws s3 cp "$src" "s3://$BUCKET/$PREFIX/$latest" \
+              --content-disposition "attachment; filename=$vname" \
+              --endpoint-url "$AWS_ENDPOINT_URL" --region auto
+            echo "promoted $vname (+ latest $latest)"
+          done
+
+      - name: Push changelog + manifest to the site
+        if: steps.cfg.outputs.skip != 'true' && steps.site.outputs.uptodate != 'true'
+        env:
+          PROJECT: ${{ steps.cfg.outputs.project }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+          MANIFEST_PATH: ${{ steps.cfg.outputs.manifestPath }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/site_deploy -o IdentitiesOnly=yes"
+          cd site
+          git config user.name "dichotic-plugins bot"
+          git config user.email "noahbaxt@gmail.com"
+          git add "static/changelogs/$PROJECT.json" "$MANIFEST_PATH"
+          if git diff --cached --quiet; then
+            echo "site already up to date for $PROJECT v$VERSION"; exit 0
+          fi
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            echo "[dry-run] would commit and push:"; git diff --cached --stat; exit 0
+          fi
+          git commit -m "Update $PROJECT to v$VERSION"
+          # release.yml may push between our clone and now; rebase and retry.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "published site changelog + manifest for $PROJECT v$VERSION"; exit 0
+            fi
+            echo "site push rejected (attempt $attempt) — rebasing onto origin/main"
+            git pull --rebase origin main
+          done
+          echo "::error::could not push site update after retries"; exit 1
+
+      - name: Summary
+        if: steps.cfg.outputs.skip != 'true' && steps.site.outputs.uptodate != 'true'
+        env:
+          PROJECT: ${{ steps.cfg.outputs.project }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+          CDN: ${{ steps.cfg.outputs.cdnBaseUrl }}
+        run: echo "Published $PROJECT v$VERSION -> $CDN + site changelog/manifest."

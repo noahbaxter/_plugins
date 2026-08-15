@@ -74,6 +74,17 @@ def asset_urls(repo: str, target: str, version: str):
     ]
 
 
+def asset_urls_from_names(repo: str, version: str, names: dict):
+    """Asset URLs for a project that does not follow the JUCE naming above.
+
+    `names` maps os -> the asset filename on that repo's GitHub release, e.g.
+    {"macos": "Stemchotic.dmg"}. Used by publish-external.yml, where the project
+    builds and names its own artifacts.
+    """
+    base = f"https://github.com/{repo}/releases/download/v{version}"
+    return [{"os": os_, "url": f"{base}/{fn}"} for os_, fn in names.items() if fn]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--changelog", required=True)
@@ -85,6 +96,9 @@ def main() -> int:
     ap.add_argument("--gated", action="store_true")
     ap.add_argument("--notes-out", default="",
                     help="also write the raw notes markdown here (for the GitHub release body)")
+    ap.add_argument("--asset-names", default="",
+                    help='JSON map of os -> release asset filename, e.g. \'{"macos":"App.dmg"}\'. '
+                         "Overrides the default JUCE asset naming (publish-external.yml).")
     args = ap.parse_args()
 
     version = _norm(args.version)
@@ -109,8 +123,14 @@ def main() -> int:
         "version": version,
         "date": date,
         "notes": notes,
-        "assets": [] if args.gated else asset_urls(args.repo, args.target, version),
+        "assets": [],
     }
+    if not args.gated:
+        entry["assets"] = (
+            asset_urls_from_names(args.repo, version, json.loads(args.asset_names))
+            if args.asset_names else
+            asset_urls(args.repo, args.target, version)
+        )
 
     out_path = Path(args.out)
     existing = []
