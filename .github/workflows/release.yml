@@ -563,6 +563,7 @@ jobs:
           GATED: ${{ needs.setup.outputs.gated }}
           MANIFEST_PATH: ${{ needs.setup.outputs.manifestPath }}
           URL: ${{ needs.setup.outputs.downloadBaseUrl }}
+          CDN: ${{ needs.setup.outputs.cdnBaseUrl }}
         run: |
           set -euo pipefail
           if [ -z "${SSH_KEY:-}" ]; then
@@ -584,8 +585,17 @@ jobs:
             --version "$VERSION" --repo "$REPO" --target "$TARGET" \
             --date "$(date -u +%Y-%m-%d)" --notes-out release-notes.md $gated_flag
 
+          # The manifest carries the version AND the stable per-OS CDN "latest" URLs, so the
+          # site's download buttons track every release with zero page edits (a new plugin needs
+          # no download config at all). These are the same keys the promote step overwrites.
           mkdir -p "site/$(dirname "$MANIFEST_PATH")"
-          printf '{\n  "version": "%s",\n  "url": "%s"\n}\n' "$VERSION" "$URL" > "site/$MANIFEST_PATH"
+          jq -n \
+            --arg v "$VERSION" --arg url "$URL" \
+            --arg mac "$CDN/${TARGET}-macOS.pkg" \
+            --arg win "$CDN/${TARGET}-Windows.exe" \
+            --arg lin "$CDN/${TARGET}-Linux-x64.zip" \
+            '{version: $v, url: $url, downloads: {macos: $mac, windows: $win, linux: $lin}}' \
+            > "site/$MANIFEST_PATH"
 
       # Only now, with the changelog validated and the site commit staged locally, do
       # we overwrite live keys. Everything below is idempotent, so a network failure
