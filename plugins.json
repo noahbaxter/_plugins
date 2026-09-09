@@ -38,6 +38,7 @@
     "r2Bucket": "dichotic-plugins",
     "cdnBaseUrl": "https://cdn.dichoticstudios.com/chartchotic",
     "windowsInstaller": ".ci/windows-installer.iss",
+    "cmakeArgs": "-DBUILD_CHANNEL=RELEASE",
     "downloadBaseUrl": "https://dichoticstudios.com/download/chartchotic",
     "manifestPath": "static/updates/chartchotic.json",
     "webBuild": null
@@ -52,6 +53,7 @@
     "r2Bucket": "dichotic-plugins",
     "cdnBaseUrl": "https://cdn.dichoticstudios.com/genericaudioplugin",
     "windowsInstaller": "installer/windows/installer.iss",
+    "cmakeArgs": "-DBUILD_CHANNEL=RELEASE",
     "downloadBaseUrl": "https://dichoticstudios.com/download/genericaudioplugin",
     "manifestPath": "static/updates/genericaudioplugin.json",
     "webBuild": null
