@@ -88,8 +88,12 @@ Rotating a key: regenerate at the source, run it again.
 
 Provenance:
 
-- **Apple (6)**: `[redacted]` sets all six.
-  Certs in `[redacted]`, password in [redacted], Team ID `KUP5WU7WPC`.
+- **Apple (6)**: export the Developer ID Application and Developer ID Installer certificates
+  from Keychain Access as `.p12`, then base64 each into `APPLE_CERTIFICATE_APPLICATION` and
+  `APPLE_CERTIFICATE_INSTALLER`. `APPLE_CERTIFICATE_PASSWORD` is the password protecting both
+  `.p12` files. `APPLE_APP_PASSWORD` is an app-specific password generated at
+  appleid.apple.com, not the Apple ID password itself. `APPLE_ID` is the notarization account
+  email, and the Team ID is on developer.apple.com under Membership.
 - **R2 (2)**: Cloudflare dashboard, R2, Manage R2 API Tokens. Object Read & Write. One token
   across all buckets is fine.
 - **`PLUGINS_CI_TOKEN`**: fine-grained PAT, Contents read/write AND Actions read/write. You

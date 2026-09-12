@@ -6,17 +6,12 @@
 # This is the one-time provisioning tool AND the "I rotated a key" tool. It reads
 # .secrets.env (gitignored; copy from .secrets.env.example) and runs `gh secret set`
 # for each non-empty value. Network-mutating: it prompts before doing anything.
-#
-# Apple signing secrets are easier to provision with the signing helper instead:
-#   [redacted]
-# That fills the six APPLE_* secrets directly. This script will still set any APPLE_*
-# values you put in .secrets.env, so use whichever path you prefer (don't double-set).
 
 source "$(dirname "$0")/lib.sh"
 require gh
 
 DRY=0
-[ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] && { sed -n '2,15p' "$0"; exit 0; }
+[ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] && { sed -n '2,8p' "$0"; exit 0; }
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
 REPO="noahbaxter/_plugins"
