@@ -131,12 +131,8 @@ plugins/<name>/              each plugin as a submodule
 
 - Windows is unsigned, so SmartScreen warns. There's a marked TODO in `build-windows` where
   Authenticode signing goes.
-- `gated` is a soft gate, not encryption. Binaries sit at stable, guessable CDN URLs; the
-  gate is only that they're not attached to the public release. Before pewpew is actually
-  paid, harden three things together: real download gating (signed or expiring URLs, noting
-  the publish window briefly exposes `_staging/<run_id>/` too), split `PLUGINS_CI_TOKEN`
-  into read and write halves so nothing write-capable sits in a `bun install` env, and
-  Authenticode-sign Windows.
+- `gated` only means binaries are not attached to the public release. It is not access
+  control. Harden before pewpew is paid.
 - Dry-run signs but skips notarization, so a notary rejection only surfaces on the real run.
   It still fails atomically, you just lose the build time.
 - The `workflow_dispatch` plugin list in `release.yml` is hand-synced with `plugins.json`.
